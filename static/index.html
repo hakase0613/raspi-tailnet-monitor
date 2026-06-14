@@ -3,22 +3,22 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Hakase Tailnet Monitor</title>
+  <title>Hakase 监控面板</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
   <header class="hero">
     <div>
-      <p class="eyebrow">Hakase Room AI Fleet</p>
-      <h1>Tailnet Monitor</h1>
-      <p class="subtitle">Tailscale reachability · services · resources · GPU · model activity</p>
+      <p class="eyebrow">Hakase 房间 AI 小队</p>
+      <h1>Tailnet 监控面板</h1>
+      <p class="subtitle">连通性 · 服务 · 资源 · GPU · 模型活动</p>
     </div>
     <div class="hero-meta">
-      <div id="meta" class="meta-pill">loading...</div>
+      <div id="meta" class="meta-pill">加载中...</div>
       <div id="clock" class="meta-sub"></div>
     </div>
   </header>
-  <section id="summary" class="summary-grid" aria-label="Fleet summary"></section>
+  <section id="summary" class="summary-grid" aria-label="小队总览"></section>
   <main id="devices" class="device-grid"></main>
   <template id="device-card">
     <section class="card device-card">
@@ -30,18 +30,19 @@
         <span class="badge"></span>
       </div>
       <div class="kv"></div>
-      <div class="section-row">
-        <h3>Resources</h3><span class="section-hint">CPU / memory / disk / load</span>
+      <div class="quick-metrics"></div>
+      <div class="section-row compact-row"><h3>温度</h3><span class="section-hint">小温度计</span></div>
+      <div class="temps thermometer-grid"></div>
+      <div class="foldout">
+        <div class="section-row"><h3>资源趋势</h3><span class="section-hint">负载 / 磁盘 / 运行时间</span></div>
+        <div class="resources visual-grid"></div>
+        <div class="section-row"><h3>GPU / VRAM 详情</h3></div>
+        <div class="gpu"></div>
+        <div class="section-row"><h3>模型活动</h3></div>
+        <div class="model-activity"></div>
+        <div class="section-row"><h3>服务 / 端口 / 健康</h3></div>
+        <div class="ops-grid"><div class="services"></div><div class="ports"></div><div class="health"></div></div>
       </div>
-      <div class="resources visual-grid"></div>
-      <div class="section-row"><h3>Temperatures</h3></div>
-      <div class="temps bar-list"></div>
-      <div class="section-row"><h3>GPU / VRAM</h3></div>
-      <div class="gpu"></div>
-      <div class="section-row"><h3>Model Activity</h3></div>
-      <div class="model-activity"></div>
-      <div class="section-row"><h3>Services / Ports / Health</h3></div>
-      <div class="ops-grid"><div class="services"></div><div class="ports"></div><div class="health"></div></div>
     </section>
   </template>
   <script src="/app.js"></script>
