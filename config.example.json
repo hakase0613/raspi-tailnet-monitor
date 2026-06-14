@@ -1,0 +1,65 @@
+{
+  "monitor": {
+    "listen_host": "0.0.0.0",
+    "listen_port": 8080,
+    "poll_interval_seconds": 30,
+    "ssh_connect_timeout": 5,
+    "ssh_command_timeout": 25,
+    "http_timeout": 5,
+    "ssh_key_path": "/home/pi/.ssh/hakase_managed_ubuntu",
+    "ssh_extra_options": [
+      "-o", "BatchMode=yes",
+      "-o", "StrictHostKeyChecking=accept-new"
+    ]
+  },
+  "devices": [
+    {
+      "name": "doer",
+      "host": "doer",
+      "ip": "100.90.79.87",
+      "ssh_user": "doer",
+      "monitored_only": false,
+      "expected_services": ["openclaw-gateway.service", "qwen-openai.service", "hakase-heartbeat.timer"],
+      "health_urls": ["http://doer:8000/health"],
+      "ports": [18789, 8000],
+      "gpu_expected": true,
+      "notes": "Tesla P4; Qwen chat service."
+    },
+    {
+      "name": "supervisor",
+      "host": "supervisor",
+      "ip": "100.82.104.107",
+      "ssh_user": "supervisor",
+      "monitored_only": false,
+      "expected_services": ["openclaw-gateway.service", "openclaw-node.service", "embedding-openai.service", "hakase-heartbeat.timer"],
+      "health_urls": ["http://supervisor:8001/health"],
+      "ports": [18789, 8001],
+      "gpu_expected": true,
+      "notes": "Tesla P4; Qwen3 embedding service."
+    },
+    {
+      "name": "coordinator",
+      "host": "coordinator",
+      "ip": "100.73.138.107",
+      "ssh_user": "coordinator",
+      "monitored_only": false,
+      "expected_services": ["openclaw-gateway.service", "openclaw-node.service", "hakase-heartbeat.timer"],
+      "health_urls": [],
+      "ports": [18789],
+      "gpu_expected": false,
+      "notes": "Coordinator node; no local model service."
+    },
+    {
+      "name": "recorder",
+      "host": "recorder",
+      "ip": "100.109.247.115",
+      "ssh_user": "recorder",
+      "monitored_only": true,
+      "expected_services": [],
+      "health_urls": [],
+      "ports": [],
+      "gpu_expected": false,
+      "notes": "Monitor only; intentionally no OpenClaw/model/heartbeat."
+    }
+  ]
+}

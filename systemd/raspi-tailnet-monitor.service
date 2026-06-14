@@ -1,0 +1,19 @@
+[Unit]
+Description=Raspberry Pi Tailnet Monitor
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/raspi-tailnet-monitor
+ExecStart=/usr/bin/python3 /opt/raspi-tailnet-monitor/app.py --config /etc/raspi-tailnet-monitor/config.json
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

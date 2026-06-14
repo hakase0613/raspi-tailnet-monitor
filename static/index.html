@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tailnet Monitor</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Tailnet Monitor</h1>
+    <div id="meta">loading...</div>
+  </header>
+  <main id="devices" class="grid"></main>
+  <template id="device-card">
+    <section class="card">
+      <div class="card-head"><h2></h2><span class="badge"></span></div>
+      <p class="notes"></p>
+      <div class="kv"></div>
+      <h3>Services</h3><div class="services"></div>
+      <h3>Health</h3><div class="health"></div>
+      <h3>GPU</h3><div class="gpu"></div>
+    </section>
+  </template>
+  <script src="/app.js"></script>
+</body>
+</html>
