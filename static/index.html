@@ -3,26 +3,45 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Tailnet Monitor</title>
+  <title>Hakase Tailnet Monitor</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
-  <header>
-    <h1>Tailnet Monitor</h1>
-    <div id="meta">loading...</div>
+  <header class="hero">
+    <div>
+      <p class="eyebrow">Hakase Room AI Fleet</p>
+      <h1>Tailnet Monitor</h1>
+      <p class="subtitle">Tailscale reachability · services · resources · GPU · model activity</p>
+    </div>
+    <div class="hero-meta">
+      <div id="meta" class="meta-pill">loading...</div>
+      <div id="clock" class="meta-sub"></div>
+    </div>
   </header>
-  <main id="devices" class="grid"></main>
+  <section id="summary" class="summary-grid" aria-label="Fleet summary"></section>
+  <main id="devices" class="device-grid"></main>
   <template id="device-card">
-    <section class="card">
-      <div class="card-head"><h2></h2><span class="badge"></span></div>
-      <p class="notes"></p>
+    <section class="card device-card">
+      <div class="card-head">
+        <div>
+          <h2></h2>
+          <p class="notes"></p>
+        </div>
+        <span class="badge"></span>
+      </div>
       <div class="kv"></div>
-      <h3>Resources</h3><div class="resources"></div>
-      <h3>Temperature</h3><div class="temps"></div>
-      <h3>Services</h3><div class="services"></div>
-      <h3>Health</h3><div class="health"></div>
-      <h3>GPU</h3><div class="gpu"></div>
-      <h3>Model Activity</h3><div class="model-activity"></div>
+      <div class="section-row">
+        <h3>Resources</h3><span class="section-hint">CPU / memory / disk / load</span>
+      </div>
+      <div class="resources visual-grid"></div>
+      <div class="section-row"><h3>Temperatures</h3></div>
+      <div class="temps bar-list"></div>
+      <div class="section-row"><h3>GPU / VRAM</h3></div>
+      <div class="gpu"></div>
+      <div class="section-row"><h3>Model Activity</h3></div>
+      <div class="model-activity"></div>
+      <div class="section-row"><h3>Services / Ports / Health</h3></div>
+      <div class="ops-grid"><div class="services"></div><div class="ports"></div><div class="health"></div></div>
     </section>
   </template>
   <script src="/app.js"></script>

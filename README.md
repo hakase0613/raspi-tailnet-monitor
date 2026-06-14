@@ -10,6 +10,19 @@
 - 配置驱动，可监控 doer / supervisor / coordinator / recorder。
 - 不保存、不打印密钥；仅使用本机已有 SSH key。
 
+
+## Dashboard visualization
+
+The UI is dependency-free and renders quantifiable metrics as lightweight browser-side visuals:
+
+- fleet summary cards for health, DERP/direct reachability, GPUs, and model parsers;
+- per-device CPU/memory/disk gauges and load sparklines;
+- temperature and model-throughput bars;
+- GPU utilization and VRAM gauges;
+- service, port, and HTTP health status chips.
+
+No CDN, npm package, or Python backend dependency is required. The browser keeps a small in-memory history for sparklines; `/api/status` remains the same JSON endpoint.
+
 ## 采集内容
 
 每台设备：
