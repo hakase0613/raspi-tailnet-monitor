@@ -39,6 +39,7 @@ function humanTempLabel(raw) {
   if (lower === "mem") return "显存 (mem)";
   if (lower.indexOf("composite") >= 0) return "NVMe Composite";
   if (lower.indexOf("nvme") >= 0) return "NVMe 固态";
+  if (lower.indexOf("zenpower") >= 0) return "CPU 核心 (zenpower)";
   if (lower === "acpitz" || lower === "x86_pkg_temp" || lower.indexOf("acpitz") >= 0 || lower.indexOf("x86_pkg_temp") >= 0) return "主板/封装";
   return s;
 }
@@ -47,6 +48,7 @@ function tempBucket(raw) {
   const lower = String(raw == null ? "" : raw).toLowerCase();
   if (!lower) return { group: 99, key: "misc" };
   if (lower.indexOf("tctl") >= 0 || lower.indexOf("k10temp") >= 0) return { group: 1, key: "cpu-tctl" };
+  if (lower.indexOf("zenpower") >= 0) return { group: 1, key: "cpu-zenpower" };
   if (lower.indexOf("tdie") >= 0) return { group: 1, key: "cpu-tdie" };
   if (lower.indexOf("coretemp") >= 0 || lower.indexOf("package id") >= 0) return { group: 1, key: "cpu-pkg" };
   if (/(^|[^a-z])core\s*\d+/i.test(lower) || lower === "core") return { group: 1, key: "cpu-core-" + lower };
@@ -81,7 +83,12 @@ const labelCases = [
   ["nvme0", "NVMe 固态", 4],
   ["mem", "显存 (mem)", 2],
   ["", "传感器", 99],
-  ["unknown-sensor", "unknown-sensor", 5]
+  ["unknown-sensor", "unknown-sensor", 5],
+  // iter3: zenpower + k10temp + case/whitespace variations of Tctl
+  ["k10temp", "CPU 核心 (Tctl)", 1],
+  ["zenpower", "CPU 核心 (zenpower)", 1],
+  ["Tctl ", "CPU 核心 (Tctl)", 1],
+  ["TCTL", "CPU 核心 (Tctl)", 1]
 ];
 
 let failures = 0;
