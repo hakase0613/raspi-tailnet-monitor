@@ -82,19 +82,71 @@
     const s = String(raw == null ? "" : raw).trim();
     if (!s) return "传感器";
     const lower = s.toLowerCase();
-    // k10temp Tctl must be checked BEFORE the generic "Tctl" check so that
-    // strings like "k10temp Tctl" / "k10temp Tdie" route to the CPU bucket.
+    // ---- Priority order (iter2): CPU core -> iGPU -> NVIDIA/Tesla -> NVMe/board ----
     if (lower.indexOf("k10temp") >= 0) return "CPU 核心 (Tctl)";
     if (lower === "tctl" || lower.indexOf("tctl") >= 0) return "CPU 核心 (Tctl)";
     if (lower === "tdie" || lower.indexOf("tdie") >= 0) return "CPU Die (Tdie)";
-    if (lower === "edge") return "核显 (edge)";
+    if (lower.indexOf("coretemp") >= 0) return "Intel CPU (coretemp)";
+    if (lower.indexOf("package id") >= 0 || lower.indexOf("physical id") >= 0) return "Intel CPU 封装";
+    if (/(^|[^a-z])core\s*\d+/i.test(s) || lower === "core") return "CPU 核心";
+    if (lower.indexOf("cpu-thermal") >= 0 || lower.indexOf("cpu_thermal") >= 0 || lower === "cpu") return "CPU 温度";
+    if (lower === "edge" || lower === "amdgpu-edge") return "核显 (edge)";
     if (lower === "junction" || lower.indexOf("junction") >= 0) return "核显结点 (junction)";
+    if (lower.indexOf("amdgpu") >= 0) return "核显 (amdgpu)";
+    if (lower.indexOf("tesla") >= 0) return "NVIDIA Tesla";
+    if (lower.indexOf("nvidia") >= 0 || lower.indexOf("geforce") >= 0 || lower.indexOf("quadro") >= 0) return "NVIDIA GPU";
     if (lower === "mem") return "显存 (mem)";
     if (lower.indexOf("composite") >= 0) return "NVMe Composite";
     if (lower.indexOf("nvme") >= 0) return "NVMe 固态";
-    if (lower.indexOf("core") >= 0 || lower.indexOf("coretemp") >= 0 || lower.indexOf("package") >= 0) return "Intel CPU";
     if (lower === "acpitz" || lower === "x86_pkg_temp" || lower.indexOf("acpitz") >= 0 || lower.indexOf("x86_pkg_temp") >= 0) return "主板/封装";
     return s;
+  }
+  /**
+   * Bucket a raw sensor label into a coarse group used for both ordering and
+   * deduplication. Same bucket+human label collapses to the hottest reading.
+   */
+  function tempBucket(raw) {
+    const lower = String(raw == null ? "" : raw).toLowerCase();
+    if (!lower) return { group: 99, key: "misc" };
+    if (lower.indexOf("tctl") >= 0 || lower.indexOf("k10temp") >= 0) return { group: 1, key: "cpu-tctl" };
+    if (lower.indexOf("tdie") >= 0) return { group: 1, key: "cpu-tdie" };
+    if (lower.indexOf("coretemp") >= 0 || lower.indexOf("package id") >= 0) return { group: 1, key: "cpu-pkg" };
+    if (/(^|[^a-z])core\s*\d+/i.test(lower) || lower === "core") return { group: 1, key: "cpu-core-" + lower };
+    if (lower.indexOf("cpu-thermal") >= 0 || lower.indexOf("cpu_thermal") >= 0 || lower === "cpu") return { group: 1, key: "cpu-thermal" };
+    if (lower === "edge" || lower.indexOf("amdgpu") >= 0) return { group: 2, key: "igpu-edge" };
+    if (lower.indexOf("junction") >= 0) return { group: 2, key: "igpu-junction" };
+    if (lower === "mem") return { group: 2, key: "igpu-vram" };
+    if (lower.indexOf("tesla") >= 0 || lower.indexOf("nvidia") >= 0 || lower.indexOf("geforce") >= 0 || lower.indexOf("quadro") >= 0) return { group: 3, key: "nvgpu-" + lower };
+    if (lower.indexOf("composite") >= 0 || lower.indexOf("nvme") >= 0) return { group: 4, key: "nvme" };
+    if (lower.indexOf("acpitz") >= 0 || lower.indexOf("x86_pkg_temp") >= 0) return { group: 4, key: "acpitz" };
+    return { group: 5, key: "misc-" + lower };
+  }
+  function dedupeTemps(temps) {
+    if (!Array.isArray(temps)) return [];
+    const map = new Map();
+    const order = [];
+    temps.forEach(t => {
+      if (!t) return;
+      const c = num(t.temp_c);
+      const human = humanTempLabel(t.label || "传感器");
+      const bucket = tempBucket(t.label || "");
+      const key = bucket.key + "|" + human;
+      if (!map.has(key)) {
+        map.set(key, { label: t.label || "传感器", human, group: bucket.group, temp_c: c, source: t.source || "", merged: 1 });
+        order.push(key);
+        return;
+      }
+      const cur = map.get(key);
+      cur.merged += 1;
+      if (c != null && (cur.temp_c == null || c > cur.temp_c)) {
+        cur.temp_c = c;
+        cur.label = t.label || cur.label;
+        cur.source = t.source || cur.source;
+      }
+    });
+    const out = order.map(k => map.get(k));
+    out.sort((a, b) => (a.group - b.group));
+    return out;
   }
   /**
    * Map a Celsius value to a temperature level: "ok" / "warn" / "bad" / "neutral".
@@ -475,8 +527,15 @@
     }
     // Use humanTempLabel to translate raw sensor labels (Tctl / edge / mem / ...)
     // into readable Chinese names. Source path is kept in the detail line for
-    // power users who want to know which /sys file this came from.
-    elm.innerHTML = temps.slice(0, 8).map(t => t ? thermometer(t.label || "传感器", num(t.temp_c), t.source || "") : "").join("");
+    // power users who want to know which /sys file this came from. Same label
+    // appearing through multiple hwmon paths is merged via dedupeTemps() to
+    // the hottest reading and rendered in CPU → iGPU → NVIDIA → other order.
+    const merged = dedupeTemps(temps).slice(0, 8);
+    elm.innerHTML = merged.map(t => {
+      if (!t) return "";
+      const detail = (t.merged > 1 ? "合并 " + t.merged + " 路 · " : "") + (t.source || "");
+      return thermometer(t.label || "传感器", num(t.temp_c), detail);
+    }).join("");
   }
 
   function renderQuickMetrics(elm, d, name, sshState) {
@@ -700,17 +759,25 @@
       const gpuUtil = num(g.utilization_gpu_percent);
       const vram = num(g.memory_used_percent);
       const temp = num(g.temperature_c);
+      const memUsedMib = num(g.memory_used_mib);
+      // Compute-idle: 0% utilization but VRAM is still reserved by a loaded
+      // model (llama.cpp / torch idling between requests).
+      const computeIdle = (gpuUtil === 0 && memUsedMib != null && memUsedMib > 0);
+      const utilDetail = computeIdle
+        ? ("显存占用 " + memUsedMib + " MiB（计算空闲）")
+        : ((g.power_w || "--") + "W · " + (temp == null ? "--" : (temp + "°C")));
       wrap.insertAdjacentHTML("beforeend",
-        '<article class="gpu-card">'
+        '<article class="gpu-card" data-compute-idle="' + (computeIdle ? 1 : 0) + '">'
         + '<div class="gpu-title"><b>' + esc(g.name || ("GPU " + i)) + '</b><small>驱动 ' + esc(g.driver || "--") + '</small></div>'
         + '<div class="visual-grid">'
-        + gaugeCard("GPU", gpuUtil, (g.power_w || "--") + "W · " + (temp == null ? "--" : (temp + "°C")))
+        + gaugeCard("GPU", gpuUtil, utilDetail)
         + gaugeCard("VRAM", vram, (g.memory_used_mib || "--") + " / " + (g.memory_total_mib || "--") + " MiB", 78, 92)
         + '</div>'
         + spark(hist(name, "gpu"), "GPU 使用率历史")
         + '<div class="chip-row">'
         + chip("显存控制器", "neutral", pct(g.utilization_memory_percent))
         + chip("剩余 VRAM", "neutral", (g.memory_free_mib || "--") + " MiB")
+        + (computeIdle ? chip("计算空闲", "neutral", "GPU 0% · 显存已加载") : "")
         + '</div></article>'
       );
     });
@@ -1045,8 +1112,13 @@
       const pi = num(data.poll_interval_seconds);
       if (pi && pi > 0) refreshIntervalMs = Math.max(3000, Math.min(120000, Math.floor(pi * 1000 * 0.7)));
 
-      // Update header
-      metaText.textContent = "更新 " + relTime(data.updated_at || Date.now());
+      // Update header (iter2: relative time + 采集滞后 lag tag when age > pi×2)
+      const upd = data.updated_at || Date.now();
+      const piSecHdr = num(data.poll_interval_seconds) || 60;
+      const ageSec = (Date.now() - (typeof upd === "number" ? upd : new Date(upd).getTime())) / 1000;
+      const lagged = Number.isFinite(ageSec) && ageSec > piSecHdr * 2;
+      metaText.textContent = "最后采集 " + relTime(upd) + (lagged ? " · 采集滞后" : "");
+      metaEl.classList.toggle("lagging", !!lagged);
       metaEl.title = "数据时间：" + (data.updated_at ? fmtIsoInSourceTz(data.updated_at) : "--") + "（点击立即刷新）";
       setBanner("");
       toastEl.hidden = true;
@@ -1113,7 +1185,13 @@
   function startTicker() {
     setInterval(() => {
       if (!lastData) return;
-      metaText.textContent = "更新 " + relTime(lastData.updated_at || Date.now());
+      // iter2: relative time + 采集滞后 lag tag when age > pi×2
+      const upd = lastData.updated_at || Date.now();
+      const piSec = num(lastData.poll_interval_seconds) || 60;
+      const ageSec = (Date.now() - (typeof upd === "number" ? upd : new Date(upd).getTime())) / 1000;
+      const lagged = Number.isFinite(ageSec) && ageSec > piSec * 2;
+      metaText.textContent = "最后采集 " + relTime(upd) + (lagged ? " · 采集滞后" : "");
+      metaEl.classList.toggle("lagging", !!lagged);
       $$(".device-card[data-name] .checked-at", devicesEl).forEach((el) => {
         const card = el.closest(".device-card");
         if (!card) return;

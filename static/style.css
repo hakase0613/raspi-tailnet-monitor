@@ -519,3 +519,65 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 
 @media (max-width: 1080px) { .task-board-grid { grid-template-columns: 1fr 1fr; } }
 @media (max-width: 900px)  { .task-board-grid { grid-template-columns: 1fr; } }
+
+/* ============================================================
+   iter2 — non-color idle vs ok differentiation
+   - ok (data flowing, non-zero): solid border + saturated tone
+   - idle (real 0% reading or 0°C reading): dashed border, accent
+     dot icon prefix, softer fill so colorblind users can still
+     distinguish "active green" from "idle blue dashed".
+   ============================================================ */
+.thermo[data-idle="1"],
+.bar-row[data-idle="1"],
+.mini-gauge[data-idle="1"],
+.gauge-card[data-idle="1"] {
+  border-style: dashed;
+  border-width: 1px;
+}
+.thermo[data-idle="1"] b::before,
+.bar-row[data-idle="1"] .bar-top span::before,
+.mini-gauge[data-idle="1"] .dial-text b::before,
+.gauge-card[data-idle="1"] .gauge-text b::before {
+  content: "•";
+  display: inline-block;
+  width: 0.9em;
+  color: var(--accent);
+  font-weight: 700;
+  margin-right: 2px;
+  vertical-align: -1px;
+}
+.idle-tag {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 5px;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  background: rgba(96, 165, 250, 0.15);
+  color: var(--accent);
+  border: 1px dashed rgba(96, 165, 250, 0.45);
+}
+/* iter2 — header lag indicator: fades the "最后采集" pill and adds a
+   small "采集滞后" tag when current age > poll_interval × 2. */
+.update-pill.lagging {
+  opacity: 0.55;
+  border-color: var(--warn-edge, var(--line-strong));
+}
+.update-pill.lagging::after {
+  content: "采集滞后";
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  background: rgba(250, 204, 21, 0.18);
+  color: #fde68a;
+  border: 1px solid rgba(250, 204, 21, 0.4);
+}
+/* iter2 — GPU "compute idle" (0% util but VRAM in use): dashed accent
+   border so it never reads as "fully idle, model unloaded". */
+.gpu-card[data-compute-idle="1"] {
+  border-style: dashed;
+  border-color: rgba(96, 165, 250, 0.45);
+}
