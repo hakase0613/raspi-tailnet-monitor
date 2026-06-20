@@ -15,13 +15,13 @@
 
 The UI is dependency-free and renders quantifiable metrics as lightweight browser-side visuals:
 
-- fleet summary cards for health, DERP/direct reachability, GPUs, and model parsers;
-- per-device CPU/memory/disk gauges and load sparklines;
-- temperature and model-throughput bars;
-- GPU utilization and VRAM gauges;
-- service, port, and HTTP health status chips.
+- top-bar NOC chips (在线 / 告警 / 离线) and a 6-card KPI strip (fleet health, DERP, GPUs, model activity, avg CPU/mem);
+- per-device CPU / memory / GPU / VRAM ring gauges, load sparkline, and history-based flash on state change;
+- temperature thermometers, GPU utilization/VRAM gauges, and model-throughput bars;
+- service / port / HTTP health chips with explicit `--` placeholders when missing;
+- skeleton placeholders on first load; global retry with exponential backoff on API failure.
 
-No CDN, npm package, or Python backend dependency is required. The browser keeps a small in-memory history for sparklines; `/api/status` remains the same JSON endpoint.
+No CDN, npm package, or Python backend dependency is required. The browser keeps a small in-memory history for sparklines; `/api/status` remains the same JSON endpoint (now also exposes `poll_interval_min/max_seconds` and `poll_intervals` for transparency).
 
 ## 采集内容
 
@@ -113,8 +113,11 @@ sudo systemctl status raspi-tailnet-monitor
 
 ## 资源占用
 
-默认每 30 秒巡检一次，最多并发 4 台 SSH；适合 Raspberry Pi 3B+。如果负载高，调大：
+默认每 60 秒巡检一次，最多并发 4 台 SSH；适合 Raspberry Pi 3B+。如果负载高或被控机较慢，可调大：
 
 ```json
-"poll_interval_seconds": 60
+"poll_interval_seconds": 120,
+"monitor_only_interval_seconds": 600
 ```
+
+`monitor_only: true` 的设备（例如 `recorder`）默认走更长的轮询周期（`max(poll_interval_seconds, monitor_only_interval_seconds)`），可大幅降低对被控设备的负载。每台设备也可单独设置 `poll_interval_seconds` 覆盖全局值。SSH 通过 `ControlMaster=auto` + `ControlPersist` 复用连接，避免每次巡检都重新握手。

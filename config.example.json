@@ -2,11 +2,13 @@
   "monitor": {
     "listen_host": "0.0.0.0",
     "listen_port": 8080,
-    "poll_interval_seconds": 30,
+    "poll_interval_seconds": 60,
+    "monitor_only_interval_seconds": 300,
     "ssh_connect_timeout": 5,
-    "ssh_command_timeout": 25,
-    "http_timeout": 5,
+    "ssh_command_timeout": 20,
+    "http_timeout": 4,
     "ssh_key_path": "/home/pi/.ssh/hakase_managed_ubuntu",
+    "ssh_control_dir": "~/.cache/raspi-tailnet-monitor/ssh-mux",
     "ssh_extra_options": [
       "-o",
       "BatchMode=yes",
