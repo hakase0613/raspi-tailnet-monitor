@@ -13,6 +13,7 @@ import argparse
 import base64
 import concurrent.futures
 import datetime as dt
+import hmac
 import http.server
 import json
 import logging
@@ -778,7 +779,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _check_auth(self) -> bool:
+        """Validate HTTP Basic Auth. Returns True when allowed.
+
+        Auth is disabled (open) when no username/password configured, keeping
+        backward compatibility with existing unauthenticated deployments.
+        Uses hmac.compare_digest for constant-time comparison.
+        """
+        auth_cfg = CONFIG.get("auth") or {}
+        exp_user = auth_cfg.get("username") or ""
+        exp_pass = auth_cfg.get("password") or ""
+        if not exp_user or not exp_pass:
+            return True
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Basic "):
+            self._unauthorized()
+            return False
+        try:
+            decoded = base64.b64decode(header[6:].strip(), validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            self._unauthorized()
+            return False
+        if ":" not in decoded:
+            self._unauthorized()
+            return False
+        user, _, pwd = decoded.partition(":")
+        user_ok = hmac.compare_digest(user.encode("utf-8"), exp_user.encode("utf-8"))
+        pass_ok = hmac.compare_digest(pwd.encode("utf-8"), exp_pass.encode("utf-8"))
+        if user_ok and pass_ok:
+            return True
+        self._unauthorized()
+        return False
+
+    def _unauthorized(self) -> None:
+        body = b"401 Unauthorized\n"
+        self._send(
+            401,
+            body,
+            "text/plain; charset=utf-8",
+            {"WWW-Authenticate": 'Basic realm="raspi-tailnet-monitor"'},
+        )
+
     def do_GET(self) -> None:  # noqa: N802
+        if not self._check_auth():
+            return
         path = self.path.split("?", 1)[0] or "/"
         if path == "/api/status":
             try:
@@ -844,6 +888,21 @@ def load_config(path: str) -> Dict[str, Any]:
         seen.add(d["name"])
         deduped.append(d)
     cfg["devices"] = deduped
+    # Optional HTTP Basic Auth. Environment variables take priority over the
+    # config file. Auth stays disabled (open) unless both user and pass exist.
+    env_user = os.environ.get("MONITOR_AUTH_USER")
+    env_pass = os.environ.get("MONITOR_AUTH_PASS")
+    auth_cfg = cfg.get("auth") if isinstance(cfg.get("auth"), dict) else {}
+    username = env_user if env_user is not None else auth_cfg.get("username", "")
+    password = env_pass if env_pass is not None else auth_cfg.get("password", "")
+    if username and password:
+        cfg["auth"] = {
+            "username": username,
+            "password": password,
+            "source": "env" if (env_user is not None and env_pass is not None) else "config",
+        }
+    else:
+        cfg.pop("auth", None)
     return cfg
 
 
@@ -882,6 +941,10 @@ def main() -> int:
     except (TypeError, ValueError):
         logger.warning("invalid listen_port %r, falling back to 8080", mon.get("listen_port"))
         port = 8080
+    if CONFIG.get("auth"):
+        logger.info("HTTP Basic Auth: ENABLED (source=%s)", CONFIG["auth"].get("source", "config"))
+    else:
+        logger.info("HTTP Basic Auth: DISABLED (server is open)")
     print(f"raspi-tailnet-monitor listening on http://{host}:{port}", flush=True)
     try:
         ThreadingHTTPServer((host, port), Handler).serve_forever()
