@@ -108,6 +108,8 @@ sudo systemctl status raspi-tailnet-monitor
 - 如果树莓派暴露到局域网外，请加反向代理认证或改为 `127.0.0.1`。
 - SSH key 请设置合适权限：`chmod 600 ~/.ssh/hakase_managed_ubuntu`。
 - 远程命令均为只读：读取 `/proc`、`systemctl --user`、`ss`、`nvidia-smi`。
+- systemd unit 使用 `ProtectHome=read-only` 并仅通过 `BindReadOnlyPaths` 放行
+  `~/.ssh` 目录，避免服务越权访问家目录。
 
 ## 资源占用
 

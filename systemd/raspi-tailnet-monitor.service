@@ -12,8 +12,12 @@ Restart=always
 RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=full
+# Lock down the home directory except for the SSH key directory, which the
+# monitor needs read access to in order to authenticate to remote devices.
 ProtectHome=read-only
+BindReadOnlyPaths=/home/pi/.ssh
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
