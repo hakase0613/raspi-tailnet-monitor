@@ -29,6 +29,7 @@
   let refreshTimer = null;
   let refreshIntervalMs = 8000; // base cadence; updated by /api/status.poll_interval_seconds
   let inFlight = false;
+  let pendingForce = false;      // a manual refresh was requested while a request was in-flight
   let firstLoad = true;
 
   function esc(s) {
@@ -59,6 +60,43 @@
     return [d && (d + "d"), h && (h + "h"), m + "m"].filter(Boolean).join(" ") || "< 1m";
   }
   function pct(v) { v = num(v); return v == null ? "--" : v.toFixed(v % 1 ? 1 : 0) + "%"; }
+  /**
+   * Format an absolute timestamp using the timezone embedded in the ISO
+   * string itself (the offset part, e.g. "+08:00" or "Z"). This avoids the
+   * pitfall where `toLocaleString` reinterprets the moment in the *viewer's*
+   * local timezone, which is wrong for cross-region users on a single
+   * monitoring server.
+   *
+   * If the input has no offset, we fall back to UTC.
+   * Returns a string like "2026-06-20 22:30:45 +08:00".
+   */
+  function fmtIsoInSourceTz(iso) {
+    if (!iso) return "--";
+    if (typeof iso !== "string") iso = String(iso);
+    // Normalize trailing "Z" -> "+00:00" so Date parsing keeps the offset.
+    const normalized = /[Zz]$/.test(iso) ? iso.replace(/[Zz]$/, "+00:00") : iso;
+    const d = new Date(normalized);
+    if (isNaN(d.getTime())) return iso;
+    // Use the parts that match the offset baked into the ISO string itself,
+    // not the viewer's local clock.
+    const pad = (n) => (n < 10 ? "0" + n : "" + n);
+    const y = d.getUTCFullYear();
+    const mo = pad(d.getUTCMonth() + 1);
+    const da = pad(d.getUTCDate());
+    const hh = pad(d.getUTCHours());
+    const mm = pad(d.getUTCMinutes());
+    const ss = pad(d.getUTCSeconds());
+    // Re-extract the offset that was in the original string (so "源时区" = source tz).
+    const m = iso.match(/([+-]\d{2}:?\d{2}|Z|[+-]\d{2})$/);
+    const off = m ? m[1].replace(/(\d{2})(\d{2})$/, "$1:$2") : "+00:00";
+    return y + "-" + mo + "-" + da + " " + hh + ":" + mm + ":" + ss + " " + off;
+  }
+  function fmtIsoTimeInSourceTz(iso) {
+    if (!iso) return "--";
+    const full = fmtIsoInSourceTz(iso);
+    // Trim to HH:MM:SS for compact card footers; keep offset tag.
+    return full.length >= 19 ? full.substring(11, 19) + " " + full.substring(20) : full;
+  }
   function relTime(isoOrTs) {
     if (!isoOrTs) return "--";
     const t = typeof isoOrTs === "number" ? isoOrTs : new Date(isoOrTs).getTime();
@@ -79,6 +117,10 @@
   }
   function deviceTone(dev) {
     if (!dev) return "bad";
+    // Local hosts are always treated as "ok": self-ping is intentionally
+    // skipped and the network category is "local".
+    const isLocal = !!(dev.is_self || (dev.network || (dev.tailscale && dev.tailscale.network)) === "local");
+    if (isLocal) return "ok";
     if (dev.ok) {
       // OK overall; escalate to warn if any monitored service is failing
       const d = dev.ssh && dev.ssh.data;
@@ -211,7 +253,17 @@
     let gpuCount = 0, modelsActive = 0, totalCpu = 0, cpuSamples = 0, totalMem = 0, memSamples = 0;
     devs.forEach(d => {
       const tone = deviceTone(d);
-      if (tone === "ok") ok++; else if (tone === "warn") warn++; else bad++;
+      // Local hosts are never counted as "offline" — they are always online.
+      const isLocal = !!(d && (d.is_self || (d.network || (d.tailscale && d.tailscale.network)) === "local"));
+      if (isLocal) {
+        ok++;
+      } else if (tone === "ok") {
+        ok++;
+      } else if (tone === "warn") {
+        warn++;
+      } else {
+        bad++;
+      }
       if (d.tailscale && d.tailscale.via_derp) derp++;
       if (d.tailscale && d.tailscale.direct) direct++;
       const dd = d.ssh && d.ssh.data;
@@ -344,7 +396,13 @@
     const badge = node.querySelector(".badge");
     let badgeText = "正常";
     let badgeTone = "ok";
-    if (!dev.ok) {
+    const isSelf = !!dev.is_self;
+    const network = (dev.network || (dev.tailscale && dev.tailscale.network) || "").toString();
+    if (isSelf || network === "local") {
+      // Self / local host: never red "offline".
+      badgeText = isSelf ? "本机" : "本地";
+      badgeTone = "ok";
+    } else if (!dev.ok) {
       const ts = dev.tailscale || {};
       badgeTone = ts.ok ? "warn" : "bad";
       badgeText = ts.ok ? "网络受限" : "离线";
@@ -355,6 +413,9 @@
     badge.textContent = badgeText;
     const piEl = node.querySelector(".poll-interval");
     const intervals = (lastData && lastData.poll_intervals) || null;
+    // Always trust the backend-supplied per-device interval. Do not hardcode
+    // any default here so the displayed value never drifts from the actual
+    // _device_interval_map() output.
     if (intervals && dev.name && intervals[dev.name]) {
       piEl.textContent = "轮询 " + intervals[dev.name] + "s";
     } else {
@@ -367,7 +428,12 @@
     hostVal.textContent = (dev.host || "?") + (dev.ip ? " · " + dev.ip : "");
     addKV(kv, "主机", hostVal);
     const netVal = el("span");
-    if (dev.tailscale && dev.tailscale.ok) {
+    if (isSelf || network === "local") {
+      // Local host: skip self-ping, surface "本机" instead of pretending
+      // it's a real offline peer.
+      const tip = dev.tailscale && dev.tailscale.raw ? dev.tailscale.raw : "本机 (tailscale 自 ping 已跳过)";
+      netVal.innerHTML = chip(isSelf ? "本机" : "本地", "ok", tip);
+    } else if (dev.tailscale && dev.tailscale.ok) {
       const t = dev.tailscale;
       const label = t.direct ? "直连" : t.via_derp ? "DERP" : "可达";
       netVal.innerHTML = chip(label, "ok");
@@ -410,7 +476,8 @@
     const checkedAt = node.querySelector(".checked-at");
     if (dev.checked_at) {
       const t = new Date(dev.checked_at);
-      checkedAt.textContent = "检查 " + (isNaN(t.getTime()) ? dev.checked_at : t.toLocaleTimeString("zh-CN")) + " · " + relTime(dev.checked_at);
+      const abs = isNaN(t.getTime()) ? dev.checked_at : fmtIsoTimeInSourceTz(dev.checked_at);
+      checkedAt.textContent = "检查 " + abs + " · " + relTime(dev.checked_at);
     } else {
       checkedAt.textContent = "";
     }
@@ -530,8 +597,34 @@
   }
 
   /* ---------- refresh loop ---------- */
+  // Single source of truth for the next refresh tick. Always clears the
+  // previously scheduled timer before queueing a new one, so manual clicks
+  // cannot stack on top of an existing scheduled refresh.
+  function scheduleNext(ms) {
+    if (refreshTimer != null) {
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
+    }
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null;
+      refresh(false);
+    }, ms);
+  }
   async function refresh(force) {
-    if (inFlight && !force) return;
+    // Always drop any pending scheduled refresh first; otherwise a manual
+    // click that lands near a scheduled tick can fire a second request.
+    if (refreshTimer != null) {
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
+    }
+    if (inFlight) {
+      // Already a request in flight. Remember the intent so we re-run
+      // immediately after it finishes, but do NOT start a second fetch.
+      if (force) pendingForce = true;
+      // Still reschedule so the timer chain keeps progressing.
+      scheduleNext(refreshIntervalMs);
+      return;
+    }
     inFlight = true;
     metaEl.classList.add("refreshing");
     try {
@@ -547,8 +640,7 @@
 
       // Update header
       metaText.textContent = "更新 " + relTime(data.updated_at || Date.now());
-      const absolute = data.updated_at ? new Date(data.updated_at) : new Date();
-      metaEl.title = "数据时间：" + (isNaN(absolute.getTime()) ? "--" : absolute.toLocaleString("zh-CN")) + "（点击立即刷新）";
+      metaEl.title = "数据时间：" + (data.updated_at ? fmtIsoInSourceTz(data.updated_at) : "--") + "（点击立即刷新）";
       setBanner("");
       toastEl.hidden = true;
       footErr.textContent = (data.errors && data.errors.length) ? ("巡检告警：" + data.errors.length + " 条") : "无错误";
@@ -566,25 +658,31 @@
     } catch (e) {
       retryAttempt++;
       metaText.textContent = "刷新失败 #" + retryAttempt;
-      metaEl.classList.remove("refreshing");
       const isFatal = retryAttempt >= 3;
       setBanner("与监控后端连接中断：" + (e && e.message ? e.message : e), isFatal ? "bad" : "warn");
       footErr.textContent = "API 请求失败";
       footErr.classList.remove("muted");
       if (isFatal) showToast("无法连接监控后端 /api/status（已重试 " + retryAttempt + " 次）");
-      // exponential backoff for next try
+      // Exponential backoff for next try. scheduleNext handles clearing
+      // any prior timer, so we don't manually clearTimeout here.
       const backoff = Math.min(60000, 2000 * Math.pow(2, Math.min(retryAttempt - 1, 5)));
-      clearTimeout(refreshTimer);
-      refreshTimer = setTimeout(refresh, backoff);
-      inFlight = false;
-      return;
-    } finally {
       metaEl.classList.remove("refreshing");
       inFlight = false;
+      scheduleNext(backoff);
+      return;
     }
-    // Schedule next refresh
-    clearTimeout(refreshTimer);
-    refreshTimer = setTimeout(refresh, refreshIntervalMs);
+    metaEl.classList.remove("refreshing");
+    inFlight = false;
+    // Schedule next refresh via the single scheduler. (The catch branch
+    // already schedules a backoff retry and returns, so we only get here on
+    // success — no risk of overwriting a backoff timer.)
+    scheduleNext(refreshIntervalMs);
+    // If a force refresh was requested while we were busy, honor it now
+    // (only one extra round to avoid run-away loops).
+    if (pendingForce) {
+      pendingForce = false;
+      scheduleNext(50);
+    }
   }
 
   /* ---------- filter UI ---------- */
@@ -615,7 +713,8 @@
         const dev = (lastData.devices || []).find(d => d && d.name === card.dataset.name);
         if (dev && dev.checked_at) {
           const t = new Date(dev.checked_at);
-          el.textContent = "检查 " + (isNaN(t.getTime()) ? dev.checked_at : t.toLocaleTimeString("zh-CN")) + " · " + relTime(dev.checked_at);
+          const abs = isNaN(t.getTime()) ? dev.checked_at : fmtIsoTimeInSourceTz(dev.checked_at);
+          el.textContent = "检查 " + abs + " · " + relTime(dev.checked_at);
         }
       });
     }, 5000);
