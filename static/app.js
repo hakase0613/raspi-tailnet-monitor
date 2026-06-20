@@ -1,4 +1,4 @@
-/* Hakase Tailnet NOC - dashboard controller */
+/* Hakase Tailnet 监控中心 - dashboard controller */
 (function () {
   "use strict";
 
@@ -16,6 +16,17 @@
   const filterInput = $("#filter-text");
   const segBtns = $$(".seg-btn");
   const tpl = $("#device-card");
+  const taskTpl = $("#task-card");
+  const taskColActive = $("#task-col-active");
+  const taskColDoneToday = $("#task-col-done-today");
+  const taskColHistory = $("#task-col-history");
+  const taskCountActive = $("#task-count-active");
+  const taskCountDoneToday = $("#task-count-done-today");
+  const taskCountHistory = $("#task-count-history");
+  const taskBoardTime = $("#task-board-time");
+  const taskRefreshBtn = $("#task-refresh");
+  const taskHistoryToggle = $("#task-history-toggle");
+  const taskHistoryCol = $(".task-col[data-col='history']");
 
   /* ---------- helpers ---------- */
   const history = new Map();      // name -> array of { t, cpu, mem, disk, load, gpu, vram, temp }
@@ -31,6 +42,14 @@
   let inFlight = false;
   let pendingForce = false;      // a manual refresh was requested while a request was in-flight
   let firstLoad = true;
+  /* ---------- task board state ---------- */
+  let taskRefreshTimer = null;
+  let taskInFlight = false;
+  let taskLastSuccessAt = 0;
+  let lastTasks = [];
+  const TASK_REFRESH_MS = 15000;
+  /* history column is collapsed by default; remember the choice in memory only. */
+  let historyExpanded = false;
 
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"']/g, function (m) {
@@ -379,11 +398,11 @@
 
     const cards = [
       { label: "在线设备", value: ok + "/" + total, foot: total ? (ok === total ? "全部正常" : (ok === 0 ? "全部离线" : (warn + bad) + " 台需关注")) : "暂无设备", tone: ok === total ? "ok" : (ok === 0 ? "bad" : "warn") },
-      { label: "告警/离线", value: (warn + bad) + "", foot: warn + " 关注 · " + bad + " 离线", tone: (warn + bad) ? (bad ? "bad" : "warn") : "ok" },
-      { label: "Tailscale", value: direct + " 直连", foot: derp + " 经 DERP", tone: derp ? "warn" : "ok" },
+      { label: "告警设备", value: warn + "", foot: warn ? "需关注" : "无", tone: warn ? "warn" : "ok" },
+      { label: "离线设备", value: bad + "", foot: bad ? "不可达" : "无", tone: bad ? "bad" : "ok" },
       { label: "GPU 在线", value: gpuCount + "", foot: gpuCount ? "已识别" : "暂无", tone: gpuCount ? "ok" : "neutral" },
-      { label: "模型活动", value: modelsActive + "", foot: modelsActive ? "有最近任务" : "暂无活动", tone: modelsActive ? "ok" : "neutral" },
-      { label: "平均 CPU", value: avgCpu == null ? "--" : avgCpu.toFixed(0) + "%", foot: avgMem == null ? "" : ("平均内存 " + avgMem.toFixed(0) + "%"), tone: avgCpu == null ? "neutral" : toneFor(avgCpu, 60, 80) }
+      { label: "平均 CPU", value: avgCpu == null ? "--" : avgCpu.toFixed(0) + "%", foot: avgMem == null ? "" : ("平均内存 " + avgMem.toFixed(0) + "%"), tone: avgCpu == null ? "neutral" : toneFor(avgCpu, 60, 80) },
+      { label: "Tailscale 链路", value: direct + " 直连", foot: derp + " 经 DERP", tone: derp ? "warn" : "ok" }
     ];
     setHTML(summaryEl, cards.map(c =>
       '<article class="kpi ' + c.tone + '" data-tone="' + c.tone + '"><div class="kpi-label">' + esc(c.label) + '</div>'
@@ -705,6 +724,225 @@
     kv.appendChild(kEl); kv.appendChild(vEl);
   }
 
+  /* ---------- task board ---------- */
+  // Map of owner string -> display label. The hint says "human name + machine emoji".
+  // Unknown owners still render so user-defined strings are never silently dropped.
+  const OWNER_DISPLAY = {
+    doer: { emoji: "🛠", cn: "doer · 行动派" },
+    supervisor: { emoji: "🔍", cn: "supervisor · 审查官" },
+    coordinator: { emoji: "📚", cn: "coordinator · 书记官" }
+  };
+  const STATUS_DISPLAY = {
+    dispatched:  { emoji: "📨", cn: "已派发",    tone: "neutral" },
+    in_progress: { emoji: "🔧", cn: "进行中",    tone: "accent" },
+    review:      { emoji: "🔎", cn: "待审查",    tone: "violet" },
+    done:        { emoji: "✅", cn: "已完成",    tone: "ok" },
+    archived:    { emoji: "📦", cn: "已归档",    tone: "muted" },
+    failed:      { emoji: "⚠️", cn: "失败",     tone: "bad" }
+  };
+  const ACTIVE_STATUSES = new Set(["dispatched", "in_progress", "review"]);
+
+  function ownerLabel(owner) {
+    const s = String(owner == null ? "" : owner).trim();
+    if (!s) return { emoji: "👤", cn: "未指派" };
+    const known = OWNER_DISPLAY[s];
+    if (known) return { emoji: known.emoji, cn: known.cn };
+    return { emoji: "👤", cn: s };
+  }
+  function statusDisplay(s) {
+    const key = String(s == null ? "" : s);
+    return STATUS_DISPLAY[key] || { emoji: "❔", cn: key || "未知", tone: "neutral" };
+  }
+  // "today 00:00 in local time" → unix seconds.
+  function todayStartTs() {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return Math.floor(d.getTime() / 1000);
+  }
+  function partitionTasks(tasks) {
+    const tStart = todayStartTs();
+    const active = [];
+    const doneToday = [];
+    const history = [];
+    const failed = [];
+    (tasks || []).forEach(t => {
+      if (!t || typeof t !== "object") return;
+      if (t.status === "failed") { failed.push(t); return; }
+      if (ACTIVE_STATUSES.has(t.status)) { active.push(t); return; }
+      if (t.status === "done") {
+        if ((t.last_ts || 0) >= tStart) doneToday.push(t);
+        else history.push(t);
+        return;
+      }
+      // archived / unknown / anything else: history bucket.
+      history.push(t);
+    });
+    // active: keep backend-provided desc order (newest first).
+    // doneToday / history: also newest first.
+    return { active, doneToday, history, failed };
+  }
+  function buildTaskCard(t) {
+    if (!taskTpl || !taskTpl.content || !taskTpl.content.firstElementChild) return null;
+    const node = taskTpl.content.firstElementChild.cloneNode(true);
+    const st = statusDisplay(t.status);
+    node.setAttribute("data-status", t.status || "");
+    const idEl = node.querySelector(".task-id");
+    if (idEl) idEl.textContent = t.id || "--";
+    const statusEl = node.querySelector(".task-status");
+    if (statusEl) {
+      statusEl.setAttribute("data-tone", st.tone);
+      statusEl.textContent = st.emoji + " " + st.cn;
+    }
+    const titleEl = node.querySelector(".task-title");
+    if (titleEl) titleEl.textContent = t.title || "(无标题)";
+    const ownerEl = node.querySelector(".task-owner");
+    if (ownerEl) {
+      const o = ownerLabel(t.owner);
+      ownerEl.textContent = o.emoji + " " + o.cn;
+    }
+    const timeEl = node.querySelector(".task-time");
+    if (timeEl) {
+      const ts = Number(t.last_ts) || 0;
+      timeEl.textContent = ts > 0 ? relTime(ts * 1000) : "--";
+    }
+    const noteEl = node.querySelector(".task-note");
+    if (noteEl) {
+      if (t.note) {
+        noteEl.textContent = t.note;
+        noteEl.hidden = false;
+      } else {
+        noteEl.textContent = "";
+        noteEl.hidden = true;
+      }
+    }
+    return node;
+  }
+  function renderColumn(container, countEl, items, emptyText) {
+    if (!container) return;
+    container.innerHTML = "";
+    if (!items || !items.length) {
+      const ph = document.createElement("div");
+      ph.className = "task-col-empty";
+      ph.textContent = emptyText || "暂无";
+      container.appendChild(ph);
+    } else {
+      items.forEach(t => {
+        const card = buildTaskCard(t);
+        if (card) container.appendChild(card);
+      });
+    }
+    if (countEl) countEl.textContent = String(items ? items.length : 0);
+  }
+  function renderFailedBanner(failed) {
+    // Surface failed tasks at the top of the board, above the columns, only when
+    // present. We create/reuse a single banner element to avoid duplicating
+    // notifications.
+    let banner = $("#task-failed-banner");
+    if (!failed || !failed.length) {
+      if (banner) banner.remove();
+      return;
+    }
+    if (!banner) {
+      banner = document.createElement("div");
+      banner.id = "task-failed-banner";
+      banner.className = "task-failed-banner";
+      const board = $("#task-board");
+      if (board) board.insertBefore(banner, board.querySelector(".task-board-grid"));
+    }
+    banner.innerHTML = '<span class="task-failed-eyebrow">⚠️ 失败任务</span>'
+      + '<div class="task-failed-list"></div>';
+    const list = banner.querySelector(".task-failed-list");
+    failed.forEach(t => {
+      const card = buildTaskCard(t);
+      if (card) list.appendChild(card);
+    });
+  }
+  function renderTaskBoard(tasks) {
+    lastTasks = Array.isArray(tasks) ? tasks : [];
+    const buckets = partitionTasks(lastTasks);
+    renderColumn(taskColActive, taskCountActive, buckets.active, taskColActive && taskColActive.getAttribute("data-empty-text"));
+    renderColumn(taskColDoneToday, taskCountDoneToday, buckets.doneToday, taskColDoneToday && taskColDoneToday.getAttribute("data-empty-text"));
+    renderColumn(taskColHistory, taskCountHistory, buckets.history, taskColHistory && taskColHistory.getAttribute("data-empty-text"));
+    renderFailedBanner(buckets.failed);
+    if (taskBoardTime) {
+      taskBoardTime.textContent = taskLastSuccessAt
+        ? ("更新 " + relTime(taskLastSuccessAt))
+        : "加载中…";
+    }
+    if (taskHistoryCol) {
+      taskHistoryCol.classList.toggle("collapsed", !historyExpanded);
+      if (taskHistoryToggle) taskHistoryToggle.setAttribute("aria-expanded", historyExpanded ? "true" : "false");
+      if (taskColHistory) {
+        if (historyExpanded) taskColHistory.removeAttribute("hidden");
+        else taskColHistory.setAttribute("hidden", "");
+      }
+    }
+  }
+  function scheduleNextTaskRefresh(ms) {
+    if (taskRefreshTimer != null) {
+      clearTimeout(taskRefreshTimer);
+      taskRefreshTimer = null;
+    }
+    taskRefreshTimer = setTimeout(() => {
+      taskRefreshTimer = null;
+      refreshTasks(false);
+    }, ms);
+  }
+  async function refreshTasks(force) {
+    if (taskRefreshTimer != null) {
+      clearTimeout(taskRefreshTimer);
+      taskRefreshTimer = null;
+    }
+    if (taskInFlight) {
+      if (force) scheduleNextTaskRefresh(50);
+      return;
+    }
+    taskInFlight = true;
+    if (taskRefreshBtn) taskRefreshBtn.classList.add("refreshing");
+    try {
+      const resp = await fetch("/api/tasks", { cache: "no-store", headers: { "X-Requested-With": "noc" } });
+      if (resp.status === 401) {
+        // Auth required but not provided — keep the existing data and surface a hint.
+        if (taskBoardTime) taskBoardTime.textContent = "需要登录（请输入凭证）";
+        scheduleNextTaskRefresh(TASK_REFRESH_MS);
+        return;
+      }
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      const data = await resp.json();
+      if (!data || !Array.isArray(data.tasks)) throw new Error("响应格式异常");
+      taskLastSuccessAt = Date.now();
+      renderTaskBoard(data.tasks);
+    } catch (e) {
+      if (taskBoardTime) taskBoardTime.textContent = "刷新失败 · " + (e && e.message ? e.message : e);
+    } finally {
+      taskInFlight = false;
+      if (taskRefreshBtn) taskRefreshBtn.classList.remove("refreshing");
+      scheduleNextTaskRefresh(TASK_REFRESH_MS);
+    }
+  }
+  function bindTaskBoard() {
+    if (taskRefreshBtn) {
+      taskRefreshBtn.addEventListener("click", () => refreshTasks(true));
+    }
+    if (taskHistoryToggle) {
+      const toggle = () => {
+        historyExpanded = !historyExpanded;
+        if (taskHistoryCol) {
+          taskHistoryCol.classList.toggle("collapsed", !historyExpanded);
+          taskHistoryToggle.setAttribute("aria-expanded", historyExpanded ? "true" : "false");
+        }
+        if (taskColHistory) {
+          if (historyExpanded) taskColHistory.removeAttribute("hidden");
+          else taskColHistory.setAttribute("hidden", "");
+        }
+      };
+      taskHistoryToggle.addEventListener("click", toggle);
+      taskHistoryToggle.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); }
+      });
+    }
+  }
+
   /* ---------- filter / list rendering ---------- */
   function matchesFilter(dev) {
     if (activeFilter === "all") return true;
@@ -892,12 +1130,14 @@
   /* ---------- init ---------- */
   function init() {
     bindFilters();
+    bindTaskBoard();
     metaEl.addEventListener("click", () => refresh(true));
     metaEl.addEventListener("keydown", (e) => {
       if (e.key === "Enter" || e.key === " ") { e.preventDefault(); refresh(true); }
     });
     startTicker();
     refresh();
+    refreshTasks(false);
   }
 
   if (document.readyState === "loading") {

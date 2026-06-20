@@ -111,6 +111,98 @@ sudo systemctl status raspi-tailnet-monitor
 - systemd unit 使用 `ProtectHome=read-only` 并仅通过 `BindReadOnlyPaths` 放行
   `~/.ssh` 目录，避免服务越权访问家目录。
 
+## 访问鉴权（HTTP Basic Auth）
+
+所有路由（`/`、`/index.html`、`/style.css`、`/app.js`、`/api/status`、`/api/tasks`）默认支持 HTTP Basic Auth。凭证按以下顺序读取，**先到先得**：
+
+1. 环境变量 `MONITOR_AUTH_USER` / `MONITOR_AUTH_PASS`（推荐用于部署/容器，优先级最高）。
+2. `config.json` 里的 `auth.username` / `auth.password`（适合开发与小团队，提交前请把 `config.json` 加入 `.gitignore`）。
+3. 若以上都没配置，启动时打印 `[AUTH DISABLED]` 且**不**强制鉴权（保持向后兼容）。
+
+示例（`config.json`）：
+
+```json
+{
+  "auth": {
+    "username": "hakase",
+    "password": "hakase0620"
+  }
+}
+```
+
+示例（环境变量）：
+
+```bash
+export MONITOR_AUTH_USER=hakase
+export MONITOR_AUTH_PASS='hakase0620'
+python3 app.py --config config.json
+```
+
+校验逻辑使用 `hmac.compare_digest` 做常量时间比较；校验失败返回 `401` 并携带 `WWW-Authenticate: Basic realm="raspi-tailnet-monitor"` 头。浏览器在第一次访问时会弹出系统级登录框，凭证会被记住并在后续请求中自动带上。
+
+## 团队任务看板 / `/api/tasks` API
+
+监控面板顶部集成了一块"团队任务看板"，用于在小队群里跟踪任务流转。后端把任务持久化到本地 JSON 文件 `state/tasks.json`（启动时自动创建目录）。所有写操作都走"写临时文件 + `os.replace`"的原子化路径，线程锁保护，并发安全。
+
+### 任务数据结构
+
+```json
+{
+  "tasks": [
+    {
+      "id": "T-20260620-001",
+      "title": "接入团队任务看板",
+      "owner": "doer",
+      "status": "in_progress",
+      "note": "等 supervisor 验收",
+      "first_ts": 1750391760,
+      "last_ts": 1750391900,
+      "history": [
+        {"status": "dispatched",  "ts": 1750391760, "note": ""},
+        {"status": "in_progress",  "ts": 1750391800, "note": "开始落地"}
+      ]
+    }
+  ]
+}
+```
+
+字段约束：
+
+- `id` 非空字符串，作为主键用于 upsert。
+- `status` 必须是 `dispatched` / `in_progress` / `done` / `review` / `archived` / `failed` 之一。
+- `owner` 建议三选一：`doer` / `supervisor` / `coordinator`，也允许自定义字符串。
+- `title` 新任务必填；后续更新可省略以保留原值。
+- `ts` Unix 秒；缺省取服务器当前时间。
+- `first_ts` 仅在插入时打戳；`last_ts` 每次更新都会被刷新。
+- `history` 每次 POST 追加一条 `{status, ts, note}`。
+
+### `GET /api/tasks`
+
+返回 `{ "tasks": [...] }`，默认按 `last_ts` 降序。可选查询参数：
+
+- `?status=in_progress,done` — 多状态过滤（英文逗号分隔）。
+- `?limit=20` — 限制返回条数。
+
+### `POST /api/tasks`
+
+写入一条任务，body 为 JSON，**需要 Basic Auth**。新增时 `id` / `status` / `owner` / `title` 必填；更新已有任务时 `owner` / `title` 可省略。返回 200 + 更新后的完整任务 JSON；非法输入返回 400。
+
+curl 示例：
+
+```bash
+curl -u hakase:hakase0620 -X POST http://localhost:8080/api/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"T-20260620-001","status":"in_progress","owner":"doer","title":"测试","note":"hello","ts":1750391760}'
+```
+
+把这条任务推到 review 状态：
+
+```bash
+curl -u hakase:hakase0620 -X POST http://localhost:8080/api/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"T-20260620-001","status":"review","note":"等 supervisor 验收"}'
+```
+
 ## 资源占用
 
 默认每 60 秒巡检一次，最多并发 4 台 SSH；适合 Raspberry Pi 3B+。如果负载高或被控机较慢，可调大：
