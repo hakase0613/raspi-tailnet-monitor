@@ -37,7 +37,67 @@
       return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[m];
     });
   }
-  function num(v) { const n = Number(v); return Number.isFinite(n) ? n : null; }
+  // Number coercion that preserves the distinction between:
+  //   - real numeric value (including 0 / 0.0) -> returned as a Number
+  //   - missing / non-numeric / NaN            -> returned as null
+  // Callers must treat the two cases differently in the UI: 0 means "I have
+  // data and the metric is idle", while null means "no data at all".
+  //
+  // Note: we explicitly reject null/undefined/"", because Number(null) === 0
+  // and Number("") === 0 in JavaScript, which would otherwise make "no data"
+  // look like a valid 0 reading. Strings like "--" still become NaN -> null
+  // because Number("--") is NaN. This is what the 0-vs-null UI distinction
+  // in miniGauge / gaugeCard / bar / thermometer relies on.
+  function num(v) {
+    if (v == null || v === "") return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  /**
+   * Map a raw /sys/class/hwmon sensor label into a human-friendly Chinese name.
+   * Unknown labels fall through unchanged so the original string is always
+   * visible (better than "Unknown" for power users).
+   * Order matters: longer / more specific keys are checked first.
+   */
+  function humanTempLabel(raw) {
+    const s = String(raw == null ? "" : raw).trim();
+    if (!s) return "传感器";
+    const lower = s.toLowerCase();
+    // k10temp Tctl must be checked BEFORE the generic "Tctl" check so that
+    // strings like "k10temp Tctl" / "k10temp Tdie" route to the CPU bucket.
+    if (lower.indexOf("k10temp") >= 0) return "CPU 核心 (Tctl)";
+    if (lower === "tctl" || lower.indexOf("tctl") >= 0) return "CPU 核心 (Tctl)";
+    if (lower === "tdie" || lower.indexOf("tdie") >= 0) return "CPU Die (Tdie)";
+    if (lower === "edge") return "核显 (edge)";
+    if (lower === "junction" || lower.indexOf("junction") >= 0) return "核显结点 (junction)";
+    if (lower === "mem") return "显存 (mem)";
+    if (lower.indexOf("composite") >= 0) return "NVMe Composite";
+    if (lower.indexOf("nvme") >= 0) return "NVMe 固态";
+    if (lower.indexOf("core") >= 0 || lower.indexOf("coretemp") >= 0 || lower.indexOf("package") >= 0) return "Intel CPU";
+    if (lower === "acpitz" || lower === "x86_pkg_temp" || lower.indexOf("acpitz") >= 0 || lower.indexOf("x86_pkg_temp") >= 0) return "主板/封装";
+    return s;
+  }
+  /**
+   * Map a Celsius value to a temperature level: "ok" / "warn" / "bad" / "neutral".
+   * Reused by thermometer() so that the per-card text and the tube color agree.
+   *  - < 65   -> ok     (正常)
+   *  - 65-82  -> warn   (偏高)
+   *  - >= 82  -> bad    (过热)
+   *  - null   -> neutral (无数据)
+   */
+  function tempLevel(c) {
+    c = num(c);
+    if (c == null) return "neutral";
+    if (c >= 82) return "bad";
+    if (c >= 65) return "warn";
+    return "ok";
+  }
+  function tempLevelLabel(level) {
+    if (level === "bad") return "过热";
+    if (level === "warn") return "偏高";
+    if (level === "ok") return "正常";
+    return "无数据";
+  }
   function clamp(v, min, max) {
     v = num(v);
     if (v == null) return null;
@@ -170,38 +230,61 @@
     const v = num(value);
     const p = v == null ? 0 : Math.max(0, Math.min(100, v));
     const tone = v == null ? "neutral" : toneFor(v, warn || 70, bad || 88);
-    return '<article class="mini-gauge ' + tone + '" style="--p:' + p + '" data-na="' + (v == null ? 1 : 0) + '" title="' + esc(label) + ' ' + pct(value) + '">'
+    const isNA = v == null ? 1 : 0;
+    const isIdle = v === 0 ? 1 : 0;
+    const detailWithIdle = isIdle
+      ? (detail ? (detail + ' · 空闲') : '空闲')
+      : (detail || "");
+    return '<article class="mini-gauge ' + tone + '" style="--p:' + p + '" data-na="' + isNA + '" data-idle="' + isIdle + '" title="' + esc(label) + ' ' + pct(value) + '">'
       + '<div class="dial" aria-label="' + esc(label) + ' ' + pct(value) + '"><span>' + pct(value) + '</span></div>'
-      + '<div class="dial-text"><b>' + esc(abbr || label) + '</b><small>' + esc(detail || "") + '</small></div>'
+      + '<div class="dial-text"><b>' + esc(abbr || label) + '</b><small>' + esc(detailWithIdle) + '</small></div>'
       + '</article>';
   }
   function gaugeCard(label, value, detail, warn, bad) {
     const v = num(value);
     const p = v == null ? 0 : Math.max(0, Math.min(100, v));
     const tone = v == null ? "neutral" : toneFor(v, warn || 70, bad || 88);
-    return '<article class="gauge-card ' + tone + '" style="--p:' + p + '" data-na="' + (v == null ? 1 : 0) + '">'
+    const isNA = v == null ? 1 : 0;
+    const isIdle = v === 0 ? 1 : 0;
+    const detailWithIdle = isIdle
+      ? (detail ? (detail + ' · 空闲') : '空闲')
+      : (detail || "");
+    return '<article class="gauge-card ' + tone + '" style="--p:' + p + '" data-na="' + isNA + '" data-idle="' + isIdle + '">'
       + '<div class="gauge"><span>' + pct(value) + '</span></div>'
-      + '<div class="gauge-text"><b>' + esc(label) + '</b><small>' + esc(detail || "") + '</small></div>'
+      + '<div class="gauge-text"><b>' + esc(label) + '</b><small>' + esc(detailWithIdle) + '</small></div>'
       + '</article>';
   }
   function bar(label, value, detail, warn, bad) {
     const v = num(value);
     const p = v == null ? 0 : Math.max(0, Math.min(100, v));
     const tone = v == null ? "neutral" : toneFor(v, warn || 70, bad || 88);
-    return '<div class="bar-row ' + tone + '" data-na="' + (v == null ? 1 : 0) + '">'
+    const isNA = v == null ? 1 : 0;
+    const isIdle = v === 0 ? 1 : 0;
+    const detailWithIdle = isIdle
+      ? (detail ? (detail + ' · 空闲') : '空闲')
+      : (detail || "");
+    return '<div class="bar-row ' + tone + '" data-na="' + isNA + '" data-idle="' + isIdle + '">'
       + '<div class="bar-top"><span>' + esc(label) + '</span><b>' + pct(value) + '</b></div>'
       + '<div class="bar"><i style="width:' + p + '%"></i></div>'
-      + (detail ? '<small>' + esc(detail) + '</small>' : '')
+      + (detailWithIdle ? '<small>' + esc(detailWithIdle) + '</small>' : '')
       + '</div>';
   }
   function thermometer(label, c, detail) {
     c = num(c);
     const p = c == null ? 0 : Math.max(0, Math.min(100, (c / 90) * 100));
-    const tone = c == null ? "neutral" : (c >= 82 ? "bad" : c >= 65 ? "warn" : "ok");
-    return '<article class="thermo ' + tone + '" style="--temp:' + p + '" title="' + esc(label) + ' ' + (c == null ? "--" : c + "°C") + '">'
+    const level = tempLevel(c);
+    const levelText = tempLevelLabel(level);
+    const tempStr = c == null ? '--' : c.toFixed(c % 1 ? 1 : 0) + '°C';
+    const isNA = c == null ? 1 : 0;
+    const isIdle = c === 0 ? 1 : 0;
+    const friendlyLabel = humanTempLabel(label);
+    const titleExtra = isNA
+      ? '（无数据）'
+      : (isIdle ? '（空闲 / 0°C 视为有效值）' : '（' + levelText + '）');
+    return '<article class="thermo ' + level + '" style="--temp:' + p + '" data-na="' + isNA + '" data-idle="' + isIdle + '" data-level="' + level + '" title="' + esc(friendlyLabel) + ' ' + tempStr + ' ' + titleExtra + '">'
       + '<div class="tube"><i></i></div>'
-      + '<div><b>' + esc(label) + '</b><strong>' + (c == null ? '--' : (c.toFixed(c % 1 ? 1 : 0) + "°C")) + '</strong>'
-      + (detail ? '<small>' + esc(detail) + '</small>' : '')
+      + '<div><b>' + esc(friendlyLabel) + '</b><strong>' + tempStr + '</strong>'
+      + '<small><span class="thermo-level ' + level + '">' + levelText + '</span>' + (detail ? ' · ' + esc(detail) : '') + '</small>'
       + '</div></article>';
   }
   function spark(vals, label) {
@@ -371,6 +454,9 @@
       elm.innerHTML = emptyState("无温度传感器（设备无 /sys/class/thermal 或 hwmon 读数）", false, "unavailable");
       return;
     }
+    // Use humanTempLabel to translate raw sensor labels (Tctl / edge / mem / ...)
+    // into readable Chinese names. Source path is kept in the detail line for
+    // power users who want to know which /sys file this came from.
     elm.innerHTML = temps.slice(0, 8).map(t => t ? thermometer(t.label || "传感器", num(t.temp_c), t.source || "") : "").join("");
   }
 

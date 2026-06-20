@@ -146,6 +146,12 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .mini-gauge.bad .dial { background: conic-gradient(var(--bad) calc(var(--p) * 1%), var(--track) 0); }
 .mini-gauge[data-na="1"] .dial { background: conic-gradient(rgba(148, 163, 184, 0.35) 100%, rgba(148, 163, 184, 0.10) 0); }
 .mini-gauge[data-na="1"] .dial span { color: var(--muted); }
+/* Idle (v === 0): the metric is valid, the device is just not loaded.
+   Visually softer than the ok-tone (which can read as "saturated green")
+   but unambiguous: not the same as data-na="1" (which is a "no data" grey). */
+.mini-gauge[data-idle="1"] { border-color: rgba(96, 165, 250, 0.22); background: rgba(96, 165, 250, 0.05); }
+.mini-gauge[data-idle="1"] .dial { background: conic-gradient(rgba(96, 165, 250, 0.55) calc(var(--p) * 1%), rgba(148, 163, 184, 0.12) 0); }
+.mini-gauge[data-idle="1"] .dial span { color: var(--cyan); }
 .dial-text b { display: block; font-size: 11px; font-weight: 700; }
 .dial-text small { display: block; color: var(--muted); font-size: 10px; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .metrics-row { display: grid; grid-template-columns: 1.4fr 1fr; gap: 10px; margin-top: 12px; }
@@ -163,6 +169,10 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .gauge-card.warn .gauge { background: conic-gradient(var(--warn) calc(var(--p) * 1%), var(--track) 0); }
 .gauge-card.bad .gauge { background: conic-gradient(var(--bad) calc(var(--p) * 1%), var(--track) 0); }
 .gauge-card[data-na="1"] .gauge { background: conic-gradient(rgba(148, 163, 184, 0.35) 100%, rgba(148, 163, 184, 0.10) 0); }
+/* Idle state for gauge-card: device is up, metric is just sitting at 0. */
+.gauge-card[data-idle="1"] { border-color: rgba(96, 165, 250, 0.25); background: rgba(96, 165, 250, 0.05); }
+.gauge-card[data-idle="1"] .gauge { background: conic-gradient(rgba(96, 165, 250, 0.55) calc(var(--p) * 1%), rgba(148, 163, 184, 0.12) 0); }
+.gauge-card[data-idle="1"] .gauge span { color: var(--cyan); }
 .gauge-text { min-width: 0; }
 .gauge-text b, .chart-card b { display: block; font-size: 12px; font-weight: 700; }
 .gauge-text small, .chart-card small { display: block; color: var(--muted); font-size: 11px; margin-top: 2px; overflow-wrap: anywhere; }
@@ -178,6 +188,8 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .bar-row.warn .bar i { background: var(--warn); }
 .bar-row.bad .bar i { background: var(--bad); }
 .bar-row[data-na="1"] .bar i { background: var(--line-strong); width: 100% !important; }
+/* Idle state for bar: a real 0% value — visually distinct from "no data" */
+.bar-row[data-idle="1"] .bar i { background: var(--accent); opacity: 0.45; }
 .thermometer-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
 .thermo { display: flex; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-soft); padding: 8px; min-width: 0; }
 .thermo.ok { color: var(--ok); }
@@ -191,6 +203,16 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .thermo b { display: block; font-size: 11px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
 .thermo strong { display: block; font-size: 15px; line-height: 1.1; color: currentColor; }
 .thermo small { display: block; color: var(--muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Temperature level label rendered inline (正常 / 偏高 / 过热 / 无数据).
+   Inherits the surrounding .thermo color so it visually matches the tube. */
+.thermo-level { display: inline-block; padding: 0 5px; border-radius: 6px; font-weight: 700; color: currentColor; }
+.thermo.ok .thermo-level { background: var(--ok-soft); }
+.thermo.warn .thermo-level { background: var(--warn-soft); }
+.thermo.bad .thermo-level { background: var(--bad-soft); }
+.thermo.neutral .thermo-level { background: rgba(148, 163, 184, 0.10); color: var(--muted); }
+/* Idle temp (exactly 0°C reading): keep the green tube but mark with a
+   subtle accent so it doesn't read as "0% alarm". */
+.thermo[data-idle="1"] { border-color: rgba(96, 165, 250, 0.25); background: rgba(96, 165, 250, 0.05); }
 .gpu-grid { display: grid; gap: 8px; }
 .gpu-title { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
 .gpu-title b { font-size: 13px; }
