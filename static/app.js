@@ -964,6 +964,38 @@
     if (dev.name) node.id = "device-card-" + dev.name;
     node.querySelector(".title").textContent = dev.name || "未命名";
     node.querySelector(".notes").textContent = dev.notes || "";
+
+    // Track SSH-fail onset so we can surface a stable "offline N m" counter on
+    // every render, even when backend `last_seen` is missing.
+    if (dev.name && dev.ssh && dev.ssh.ok === true) {
+      firstSeenSshFail.delete(dev.name);
+    }
+    if (dev.name && dev.ssh && dev.ssh.ok === false) {
+      if (!firstSeenSshFail.has(dev.name)) {
+        firstSeenSshFail.set(dev.name, Date.now());
+      }
+    }
+    if (dev.ssh && dev.ssh.ok === false) {
+      let anchorMs = firstSeenSshFail.get(dev.name);
+      if (!anchorMs) {
+        anchorMs = Date.now();
+        firstSeenSshFail.set(dev.name, anchorMs);
+      }
+      if (dev.last_seen) {
+        const parsed = Date.parse(dev.last_seen);
+        if (Number.isFinite(parsed)) anchorMs = parsed;
+      }
+      const offlineSec = Math.max(1, Math.floor((Date.now() - anchorMs) / 1000));
+      const chip = document.createElement("span");
+      chip.className = "offline-chip bad";
+      chip.style.cssText = "float:right;background:#ef4444;color:#fff;border-radius:8px;padding:2px 8px;font-size:11px";
+      chip.textContent = "离线 " + humanDuration(offlineSec);
+      const titleEl = node.querySelector(".title");
+      if (titleEl && titleEl.parentNode) {
+        if (titleEl.nextSibling) titleEl.parentNode.insertBefore(chip, titleEl.nextSibling);
+        else titleEl.parentNode.appendChild(chip);
+      }
+    }
     const badge = node.querySelector(".badge");
     let badgeText = "正常";
     let badgeTone = "ok";
