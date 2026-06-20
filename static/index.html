@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#0b1424" />
-  <title>Hakase Tailnet NOC</title>
+  <title>Hakase Tailnet 监控面板</title>
   <link rel="stylesheet" href="/style.css" />
   <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23111827'/><circle cx='16' cy='16' r='5' fill='%2334d399'/><circle cx='16' cy='16' r='10' fill='none' stroke='%2334d399' stroke-width='1.4' opacity='.45'/></svg>" />
 </head>
@@ -29,7 +29,7 @@
       </span>
       <div>
         <p class="eyebrow">Hakase 房间 · AI 小队</p>
-        <h1>Tailnet NOC</h1>
+        <h1>Tailnet 监控中心</h1>
       </div>
     </div>
     <nav class="topbar-meta" aria-label="状态总览">
@@ -51,12 +51,51 @@
     </nav>
     <div class="topbar-right">
       <div id="banner" class="banner" role="status" aria-live="polite" hidden></div>
-      <div class="update-pill" id="meta" title="点击立即刷新" role="button" tabindex="0">
+      <div class="update-pill" id="meta" title="点击立即刷新" role="button" tabindex="0" aria-label="手动刷新数据">
         <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M12 6V3l4 4-4 4V8a5 5 0 1 0 5 5h2a7 7 0 1 1-7-7z"/></svg>
         <span id="meta-text">加载中…</span>
       </div>
     </div>
   </header>
+
+  <section class="task-board" id="task-board" aria-label="团队任务看板">
+    <div class="task-board-head">
+      <div class="task-board-title">
+        <h2>📋 团队任务看板</h2>
+        <span class="muted small" id="task-board-time">加载中…</span>
+      </div>
+      <div class="task-board-actions">
+        <button type="button" class="ghost-btn" id="task-refresh" aria-label="刷新任务看板">刷新</button>
+      </div>
+    </div>
+    <div class="task-board-grid">
+      <div class="task-col" data-col="active">
+        <header class="task-col-head">
+          <span class="task-col-emoji" aria-hidden="true">🔧</span>
+          <span class="task-col-title">进行中</span>
+          <span class="task-col-count" id="task-count-active">0</span>
+        </header>
+        <div class="task-col-body" id="task-col-active" data-empty-text="暂无进行中任务，在群里发任务卡试试 📋"></div>
+      </div>
+      <div class="task-col" data-col="done-today">
+        <header class="task-col-head">
+          <span class="task-col-emoji" aria-hidden="true">✅</span>
+          <span class="task-col-title">今日完成</span>
+          <span class="task-col-count" id="task-count-done-today">0</span>
+        </header>
+        <div class="task-col-body" id="task-col-done-today" data-empty-text="今天还没有 done 的任务 ✨"></div>
+      </div>
+      <div class="task-col collapsed" data-col="history">
+        <header class="task-col-head" id="task-history-toggle" role="button" tabindex="0" aria-expanded="false" aria-controls="task-col-history">
+          <span class="task-col-emoji" aria-hidden="true">📦</span>
+          <span class="task-col-title">历史</span>
+          <span class="task-col-count" id="task-count-history">0</span>
+          <span class="task-col-toggle" aria-hidden="true">▾</span>
+        </header>
+        <div class="task-col-body" id="task-col-history" data-empty-text="还没有归档任务" hidden></div>
+      </div>
+    </div>
+  </section>
 
   <section class="kpis" id="kpis" aria-label="舰队关键指标"></section>
 
@@ -64,7 +103,7 @@
     <div class="subbar-left">
       <label class="search">
         <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M10 4a6 6 0 1 1-4.243 10.243l-3.535 3.535-1.414-1.414 3.535-3.535A6 6 0 0 1 10 4zm0 2a4 4 0 1 0 0 8 4 4 0 0 0 0-8z"/></svg>
-        <input type="search" id="filter-text" placeholder="搜索设备名 / 主机 / IP / 备注…" autocomplete="off" spellcheck="false" />
+        <input type="search" id="filter-text" placeholder="搜索设备名 / 主机 / IP / 备注…" autocomplete="off" spellcheck="false" aria-label="按设备名/主机/IP/备注过滤" />
       </label>
       <div class="seg" role="tablist" aria-label="按状态过滤">
         <button class="seg-btn active" data-filter="all" role="tab" aria-selected="true">全部</button>
@@ -103,7 +142,7 @@
   </main>
 
   <footer class="footbar">
-    <span>API <code>/api/status</code></span>
+    <span>API <code>/api/status</code> · <code>/api/tasks</code></span>
     <span class="sep">·</span>
     <span id="foot-err" class="muted">无错误</span>
   </footer>
@@ -153,6 +192,21 @@
         <span class="muted small" data-change></span>
       </footer>
     </section>
+  </template>
+
+  <template id="task-card">
+    <article class="task-card" data-status="">
+      <header class="task-card-head">
+        <span class="task-id mono"></span>
+        <span class="task-status" data-tone=""></span>
+      </header>
+      <h3 class="task-title"></h3>
+      <div class="task-meta">
+        <span class="task-owner"></span>
+        <span class="task-time"></span>
+      </div>
+      <p class="task-note"></p>
+    </article>
   </template>
 
   <div id="toast" class="toast" role="alert" aria-live="assertive" hidden></div>

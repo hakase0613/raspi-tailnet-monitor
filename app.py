@@ -13,6 +13,7 @@ import argparse
 import base64
 import concurrent.futures
 import datetime as dt
+import hmac
 import http.server
 import json
 import logging
@@ -24,6 +25,7 @@ import socket
 import socketserver
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -33,7 +35,10 @@ from typing import Any, Dict, List, Optional
 
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 STATIC_DIR = (BASE_DIR / "static").resolve()
+STATE_DIR = (BASE_DIR / "state").resolve()
+TASKS_FILE = (STATE_DIR / "tasks.json")
 STATE_LOCK = threading.Lock()
+TASKS_LOCK = threading.Lock()
 STATE: Dict[str, Any] = {"ok": False, "started_at": None, "updated_at": None, "poll_interval_seconds": None, "poll_interval_min_seconds": None, "poll_interval_max_seconds": None, "devices": [], "errors": []}
 CONFIG: Dict[str, Any] = {}
 
@@ -778,7 +783,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _check_auth(self) -> bool:
+        """Validate HTTP Basic Auth. Returns True when allowed.
+
+        Auth is disabled (open) when no username/password configured, keeping
+        backward compatibility with existing unauthenticated deployments.
+        Uses hmac.compare_digest for constant-time comparison.
+        """
+        auth_cfg = CONFIG.get("auth") or {}
+        exp_user = str(auth_cfg.get("username") or "")
+        exp_pass = str(auth_cfg.get("password") or "")
+        if not exp_user or not exp_pass:
+            return True
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Basic "):
+            self._unauthorized()
+            return False
+        try:
+            decoded = base64.b64decode(header[6:].strip(), validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            self._unauthorized()
+            return False
+        if ":" not in decoded:
+            self._unauthorized()
+            return False
+        user, _, pwd = decoded.partition(":")
+        user_ok = hmac.compare_digest(user.encode("utf-8"), exp_user.encode("utf-8"))
+        pass_ok = hmac.compare_digest(pwd.encode("utf-8"), exp_pass.encode("utf-8"))
+        if user_ok and pass_ok:
+            return True
+        self._unauthorized()
+        return False
+
+    def _unauthorized(self) -> None:
+        body = json.dumps({"error": "unauthorized"}, ensure_ascii=False).encode("utf-8")
+        self._send(
+            401,
+            body,
+            "application/json; charset=utf-8",
+            {"WWW-Authenticate": 'Basic realm="raspi-tailnet-monitor"'},
+        )
+
     def do_GET(self) -> None:  # noqa: N802
+        if not self._check_auth():
+            return
         path = self.path.split("?", 1)[0] or "/"
         if path == "/api/status":
             try:
@@ -788,6 +836,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(500, json.dumps({"error": f"state serialization failed: {e}"}).encode("utf-8"), "application/json; charset=utf-8")
                 return
             self._send(200, data, "application/json; charset=utf-8")
+            return
+        if path == "/api/tasks":
+            try:
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                tasks = load_tasks()
+                items = tasks.get("tasks") or []
+                # Optional filters: ?limit=N&status=in_progress,done
+                if qs.get("status"):
+                    wanted = set(s for s in qs["status"][0].split(",") if s)
+                    items = [t for t in items if isinstance(t, dict) and t.get("status") in wanted]
+                try:
+                    limit = int(qs.get("limit", [0])[0]) if qs.get("limit") else 0
+                except (TypeError, ValueError):
+                    limit = 0
+                if limit > 0:
+                    items = items[:limit]
+                self._send(200, json.dumps({"tasks": items}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            except (OSError, ValueError) as e:
+                self._send(500, json.dumps({"error": f"tasks read failed: {e}"}).encode("utf-8"), "application/json; charset=utf-8")
             return
         if path == "/":
             path = "/index.html"
@@ -813,10 +880,188 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ctype = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
         self._send(200, data, ctype)
 
+    def do_POST(self) -> None:  # noqa: N802
+        if not self._check_auth():
+            return
+        path = self.path.split("?", 1)[0] or "/"
+        if path != "/api/tasks":
+            self._send(404, json.dumps({"error": "not found"}).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0 or length > 65536:
+            self._send(400, json.dumps({"error": "missing or oversized body"}).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        try:
+            raw = self.rfile.read(length)
+            payload = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            self._send(400, json.dumps({"error": f"invalid json: {e}"}).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        if not isinstance(payload, dict):
+            self._send(400, json.dumps({"error": "body must be a json object"}).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        try:
+            saved = upsert_task(payload)
+        except ValueError as e:
+            self._send(400, json.dumps({"error": str(e)}).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        except OSError as e:
+            self._send(500, json.dumps({"error": f"tasks write failed: {e}"}).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        self._send(200, json.dumps(saved, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+
+# ---------------------------------------------------------------------------
+# Tasks persistence (team task board)
+# ---------------------------------------------------------------------------
+TASK_STATUSES = {"dispatched", "in_progress", "done", "review", "archived", "failed"}
+SUGGESTED_OWNERS = {"doer", "supervisor", "coordinator"}
+
+
+def _ensure_state_dir() -> None:
+    """Create the state directory on demand; tolerate concurrent creation."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning("failed to create state dir %s: %s", STATE_DIR, e)
+
+
+def load_tasks() -> Dict[str, Any]:
+    """Read tasks.json. Missing file -> empty store. Defensive against bad JSON."""
+    _ensure_state_dir()
+    if not TASKS_FILE.is_file():
+        return {"tasks": []}
+    try:
+        with TASKS_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("tasks.json unreadable (%s); returning empty list", e)
+        return {"tasks": []}
+    if not isinstance(data, dict):
+        return {"tasks": []}
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list):
+        data["tasks"] = []
+    return data
+
+
+def _atomic_write_json(target: pathlib.Path, payload: Dict[str, Any]) -> None:
+    """Write `payload` to `target` atomically (temp + os.replace).
+
+    Same-directory temp file keeps the rename cheap and atomic on POSIX.
+    """
+    _ensure_state_dir()
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tasks.", suffix=".json.tmp", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path, target)
+    except Exception:
+        # Best-effort cleanup of the temp file if replace failed.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def upsert_task(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Insert or update a task by id. Returns the saved task record.
+
+    - id: required, non-empty string.
+    - status: must be in TASK_STATUSES.
+    - owner: required for new tasks; existing tasks keep their owner if omitted.
+    - title: required for new tasks; existing tasks keep their title if omitted.
+    - note: optional free-form.
+    - ts: unix seconds; defaults to now.
+    - first_ts: stamped on insert, preserved on update.
+    - history: appended (one entry per call) on every update.
+    """
+    tid = payload.get("id")
+    if not isinstance(tid, str) or not tid.strip():
+        raise ValueError("id is required")
+    status = payload.get("status")
+    if status not in TASK_STATUSES:
+        raise ValueError(f"status must be one of {sorted(TASK_STATUSES)}")
+    owner_in = payload.get("owner")
+    if owner_in is not None and not isinstance(owner_in, str):
+        raise ValueError("owner must be a string when provided")
+    title_in = payload.get("title")
+    if title_in is not None and not isinstance(title_in, str):
+        raise ValueError("title must be a string when provided")
+    note_in = payload.get("note")
+    if note_in is not None and not isinstance(note_in, str):
+        raise ValueError("note must be a string when provided")
+    ts_in = payload.get("ts")
+    if ts_in is not None:
+        try:
+            ts = int(ts_in)
+        except (TypeError, ValueError):
+            raise ValueError("ts must be a unix-seconds integer")
+    else:
+        ts = int(time.time())
+    if ts <= 0:
+        ts = int(time.time())
+
+    with TASKS_LOCK:
+        data = load_tasks()
+        tasks = data.get("tasks") or []
+        idx = next((i for i, t in enumerate(tasks) if isinstance(t, dict) and t.get("id") == tid), -1)
+        if idx >= 0:
+            existing = tasks[idx]
+            owner = (owner_in if isinstance(owner_in, str) and owner_in.strip() else existing.get("owner") or "")
+            title = (title_in if isinstance(title_in, str) and title_in.strip() else existing.get("title") or "")
+            note = note_in if isinstance(note_in, str) else (existing.get("note") or "")
+            first_ts = int(existing.get("first_ts") or ts)
+            history = list(existing.get("history") or [])
+            history.append({"status": status, "ts": ts, "note": note if isinstance(note_in, str) else ""})
+            saved = {
+                "id": tid,
+                "title": title,
+                "owner": owner,
+                "status": status,
+                "note": note,
+                "first_ts": first_ts,
+                "last_ts": ts,
+                "history": history,
+            }
+            tasks[idx] = saved
+        else:
+            if not isinstance(title_in, str) or not title_in.strip():
+                raise ValueError("title is required for new tasks")
+            if not isinstance(owner_in, str) or not owner_in.strip():
+                raise ValueError("owner is required for new tasks")
+            note = note_in if isinstance(note_in, str) else ""
+            saved = {
+                "id": tid,
+                "title": title_in,
+                "owner": owner_in,
+                "status": status,
+                "note": note,
+                "first_ts": ts,
+                "last_ts": ts,
+                "history": [{"status": status, "ts": ts, "note": note}],
+            }
+            tasks.append(saved)
+        # Sort by last_ts desc so consumers can iterate newest-first.
+        tasks.sort(key=lambda x: (int(x.get("last_ts") or 0) if isinstance(x, dict) else 0), reverse=True)
+        data["tasks"] = tasks
+        _atomic_write_json(TASKS_FILE, data)
+    return saved
 
 
 def load_config(path: str) -> Dict[str, Any]:
@@ -844,6 +1089,25 @@ def load_config(path: str) -> Dict[str, Any]:
         seen.add(d["name"])
         deduped.append(d)
     cfg["devices"] = deduped
+    # Optional HTTP Basic Auth. Environment variables take priority over the
+    # config file. Auth stays disabled (open) unless both user and pass exist.
+    env_user = os.environ.get("MONITOR_AUTH_USER")
+    env_pass = os.environ.get("MONITOR_AUTH_PASS")
+    raw_auth = cfg.get("auth")
+    auth_cfg = raw_auth if isinstance(raw_auth, dict) else {}
+    cfg_user = auth_cfg.get("username")
+    cfg_pass = auth_cfg.get("password")
+    username = env_user if env_user is not None else (cfg_user if isinstance(cfg_user, str) else "")
+    password = env_pass if env_pass is not None else (cfg_pass if isinstance(cfg_pass, str) else "")
+    if username and password:
+        env_used = env_user is not None and env_pass is not None
+        cfg["auth"] = {
+            "username": username,
+            "password": password,
+            "source": "env" if env_used else "config",
+        }
+    else:
+        cfg.pop("auth", None)
     return cfg
 
 
@@ -882,6 +1146,13 @@ def main() -> int:
     except (TypeError, ValueError):
         logger.warning("invalid listen_port %r, falling back to 8080", mon.get("listen_port"))
         port = 8080
+    if CONFIG.get("auth"):
+        logger.info("HTTP Basic Auth: ENABLED (source=%s)", CONFIG["auth"].get("source", "config"))
+    else:
+        print("[AUTH DISABLED]", flush=True)
+        logger.info("HTTP Basic Auth: DISABLED (server is open)")
+    # Pre-create the tasks state dir so the file mtime is sensible on a clean install.
+    _ensure_state_dir()
     print(f"raspi-tailnet-monitor listening on http://{host}:{port}", flush=True)
     try:
         ThreadingHTTPServer((host, port), Handler).serve_forever()

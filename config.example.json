@@ -1,4 +1,8 @@
 {
+  "auth": {
+    "username": "hakase",
+    "password": "changeme"
+  },
   "monitor": {
     "listen_host": "0.0.0.0",
     "listen_port": 8080,
