@@ -121,39 +121,3 @@ sudo systemctl status raspi-tailnet-monitor
 ```
 
 `monitor_only: true` 的设备（例如 `recorder`）默认走更长的轮询周期（`max(poll_interval_seconds, monitor_only_interval_seconds)`），可大幅降低对被控设备的负载。每台设备也可单独设置 `poll_interval_seconds` 覆盖全局值。SSH 通过 `ControlMaster=auto` + `ControlPersist` 复用连接，避免每次巡检都重新握手。
-
-
-## HTTP Basic Auth（可选）
-
-监控面板支持可选的 HTTP Basic Auth，保护所有路由（`/`、`/index.html`、`/api/status`、`/static/*`）。
-
-启用方式（二选一，环境变量优先级更高）：
-
-1. **config.json**：在顶层加入 `auth` 字段：
-
-   ```json
-   {
-     "auth": { "username": "hasake", "password": "你的密码" },
-     "monitor": { ... },
-     "devices": [ ... ]
-   }
-   ```
-
-2. **环境变量**：设置 `MONITOR_AUTH_USER` 和 `MONITOR_AUTH_PASS`。环境变量会覆盖 config.json 里的 `auth`。
-
-   ```bash
-   MONITOR_AUTH_USER=hasake MONITOR_AUTH_PASS=你的密码 python3 app.py --config config.json
-   ```
-
-**向后兼容**：如果既没有 `config.auth` 也没有设置环境变量（或用户名/密码为空），认证保持关闭，服务完全开放，不影响现有无认证部署。启动日志会打印 `HTTP Basic Auth: ENABLED/DISABLED`（不会打印密码明文）。
-
-**实现细节**：纯标准库（`base64` + `hmac`），用 `hmac.compare_digest` 做常数时间比较防时序攻击；认证失败返回 `401` 并带 `WWW-Authenticate: Basic realm="raspi-tailnet-monitor"` 头。
-
-测试：
-
-```bash
-curl -i http://127.0.0.1:8080/            # 401
-curl -i -u hasake:你的密码 http://127.0.0.1:8080/   # 200
-```
-
-> 注意：`config.json` 已加入 `.gitignore`，请不要把真实凭证提交到仓库。

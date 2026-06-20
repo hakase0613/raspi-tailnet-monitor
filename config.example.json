@@ -16,10 +16,6 @@
       "StrictHostKeyChecking=accept-new"
     ]
   },
-  "auth": {
-    "username": "hasake",
-    "password": "change-me"
-  },
   "devices": [
     {
       "name": "doer",
