@@ -20,6 +20,7 @@ import mimetypes
 import os
 import pathlib
 import shlex
+import socket
 import socketserver
 import subprocess
 import sys
@@ -37,6 +38,98 @@ STATE: Dict[str, Any] = {"ok": False, "started_at": None, "updated_at": None, "p
 CONFIG: Dict[str, Any] = {}
 
 logger = logging.getLogger("raspi-tailnet-monitor")
+
+
+# ---------------------------------------------------------------------------
+# Local-host identity cache
+# ---------------------------------------------------------------------------
+# We avoid `tailscale ping <self-ip>` because self-pings through Tailscale do
+# not give a useful answer and pollute the "offline" counters. We detect the
+# "this device is monitoring itself" case by comparing the device target
+# against the host's own tailscale IPs / hostname, cached once per process.
+_LOCAL_IDENTITY: Dict[str, Any] = {"tailscale_ips": set(), "hostname": "", "loaded": False}
+_LOCAL_IDENTITY_LOCK = threading.Lock()
+
+
+def _detect_tailscale_ips() -> set:
+    """Best-effort discovery of this host's own Tailscale IPv4 addresses."""
+    ips: set = set()
+    # Preferred: `tailscale ip -4` returns one IP per line for this node.
+    try:
+        p = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=4,
+        )
+        if p.returncode == 0:
+            for line in (p.stdout or "").splitlines():
+                tok = line.strip()
+                if tok:
+                    ips.add(tok)
+    except Exception:
+        pass
+    # Fallback: read tailscale0 interface from `ip` (or `hostname -I`).
+    if not ips:
+        try:
+            p = subprocess.run(
+                ["ip", "-4", "-o", "addr", "show", "dev", "tailscale0"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=4,
+            )
+            if p.returncode == 0:
+                for line in (p.stdout or "").splitlines():
+                    parts = line.split()
+                    # `ip -o addr` columns: "2: tailscale0 inet 100.x.y.z/32 ..."
+                    for tok in parts:
+                        if "/" in tok and tok.count(".") == 3:
+                            ip = tok.split("/", 1)[0].strip()
+                            if ip:
+                                ips.add(ip)
+        except Exception:
+            pass
+    return ips
+
+
+def local_identity() -> Dict[str, Any]:
+    """Return this host's identity (tailscale IPs + hostname), cached."""
+    with _LOCAL_IDENTITY_LOCK:
+        if _LOCAL_IDENTITY.get("loaded"):
+            return _LOCAL_IDENTITY
+        ips = _detect_tailscale_ips()
+        try:
+            host = socket.gethostname() or ""
+        except Exception:
+            host = ""
+        _LOCAL_IDENTITY["tailscale_ips"] = ips
+        _LOCAL_IDENTITY["hostname"] = host
+        _LOCAL_IDENTITY["loaded"] = True
+        logger.info("local identity: hostname=%s, tailscale_ips=%s", host, sorted(ips) or "[]")
+        return _LOCAL_IDENTITY
+
+
+def is_self_device(device: Dict[str, Any]) -> bool:
+    """Return True when the given device refers to the local host."""
+    ident = local_identity()
+    host = (device.get("host") or "").strip()
+    ip = (device.get("ip") or "").strip()
+    name = (device.get("name") or "").strip()
+    local_ips = ident.get("tailscale_ips") or set()
+    local_host = (ident.get("hostname") or "").strip()
+    if local_ips:
+        if ip and ip in local_ips:
+            return True
+        if host and host in local_ips:
+            return True
+    if local_host:
+        if host and host == local_host:
+            return True
+        if name and name == local_host:
+            return True
+    return False
 
 REMOTE_PROBE = r'''
 import glob, json, os, re, shutil, subprocess, sys, time
@@ -456,6 +549,7 @@ def http_health(url: str, timeout: int) -> Dict[str, Any]:
 
 def check_device(device: Dict[str, Any], monitor: Dict[str, Any]) -> Dict[str, Any]:
     started = time.time()
+    is_self = is_self_device(device)
     result: Dict[str, Any] = {
         "name": device.get("name"),
         "host": device.get("host"),
@@ -463,11 +557,35 @@ def check_device(device: Dict[str, Any], monitor: Dict[str, Any]) -> Dict[str, A
         "notes": device.get("notes", "") or "",
         "monitored_only": bool(device.get("monitored_only")),
         "checked_at": now_iso(),
+        "is_self": is_self,
     }
-    try:
-        result["tailscale"] = tailscale_ping(device, int(monitor.get("ssh_connect_timeout", 5)) + 3)
-    except Exception as e:
-        result["tailscale"] = {"ok": False, "error": str(e), "raw": "", "via_derp": False, "direct": False}
+    # Network classification (new field). Values:
+    #   "local"   -> this is the local host (skip self ping)
+    #   "online"  -> tailscale ping reached the peer
+    #   "offline" -> tailscale ping failed
+    #   "unknown" -> could not determine
+    if is_self:
+        # Do NOT run `tailscale ping <self-ip>`; it fails by design and would
+        # wrongly mark this host as offline. Mark the network as local.
+        result["tailscale"] = {
+            "ok": True,
+            "self": True,
+            "network": "local",
+            "raw": "local host (self), tailscale self-ping skipped",
+            "via_derp": False,
+            "direct": True,
+            "skipped": True,
+        }
+        result["network"] = "local"
+    else:
+        try:
+            ts = tailscale_ping(device, int(monitor.get("ssh_connect_timeout", 5)) + 3)
+        except Exception as e:
+            ts = {"ok": False, "error": str(e), "raw": "", "via_derp": False, "direct": False}
+        ts.setdefault("self", False)
+        ts.setdefault("network", "online" if ts.get("ok") else "offline")
+        result["tailscale"] = ts
+        result["network"] = "online" if ts.get("ok") else "offline"
     try:
         result["ssh"] = ssh_probe(device, monitor)
     except Exception as e:
@@ -479,7 +597,15 @@ def check_device(device: Dict[str, Any], monitor: Dict[str, Any]) -> Dict[str, A
         result["health"] = []
         result["health_error"] = str(e)
     result["duration_ms"] = int((time.time() - started) * 1000)
-    ok_parts = [bool(result["tailscale"].get("ok")), bool(result["ssh"].get("ok"))]
+    # Overall OK aggregation:
+    # - For the local host we trust SSH (and health). tailscale is intentionally
+    #   skipped so it must not flip "ok" to False.
+    # - For all other devices we still require tailscale ping to succeed, so the
+    #   "offline" indicator remains meaningful for genuine peers.
+    if is_self:
+        ok_parts = [bool(result["ssh"].get("ok"))]
+    else:
+        ok_parts = [bool(result["tailscale"].get("ok")), bool(result["ssh"].get("ok"))]
     if result.get("health"):
         ok_parts.append(all(h.get("ok") for h in result["health"]))
     result["ok"] = all(ok_parts)
