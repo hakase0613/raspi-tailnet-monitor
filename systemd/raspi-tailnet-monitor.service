@@ -12,10 +12,12 @@ Restart=always
 RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
-# Lock down the home directory except for the SSH key directory, which the
-# monitor needs read access to in order to authenticate to remote devices.
+# Lock down the home directory except for the SSH key directory (read for
+# authentication) and the SSH multiplexing control socket directory (read/write
+# for connection reuse across poll cycles).
 ProtectHome=read-only
 BindReadOnlyPaths=/home/pi/.ssh
+BindReadWritePaths=/home/pi/.cache/raspi-tailnet-monitor
 StandardOutput=journal
 StandardError=journal
 

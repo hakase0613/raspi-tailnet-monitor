@@ -2,49 +2,160 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Hakase 监控面板</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b1424" />
+  <title>Hakase Tailnet NOC</title>
   <link rel="stylesheet" href="/style.css" />
+  <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23111827'/><circle cx='16' cy='16' r='5' fill='%2334d399'/><circle cx='16' cy='16' r='10' fill='none' stroke='%2334d399' stroke-width='1.4' opacity='.45'/></svg>" />
 </head>
 <body>
-  <header class="hero">
-    <div>
-      <p class="eyebrow">Hakase 房间 AI 小队</p>
-      <h1>Tailnet 监控面板</h1>
-      <p class="subtitle">连通性 · 服务 · 资源 · GPU · 模型活动</p>
+  <a href="#devices" class="skip-link">跳到设备列表</a>
+
+  <header class="topbar" role="banner">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" width="28" height="28">
+          <rect width="32" height="32" rx="8" fill="url(#bg)"/>
+          <defs>
+            <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+              <stop offset="0" stop-color="#1d4ed8"/>
+              <stop offset="1" stop-color="#7c3aed"/>
+            </linearGradient>
+          </defs>
+          <circle cx="16" cy="16" r="4.6" fill="#34d399"/>
+          <circle cx="16" cy="16" r="9" fill="none" stroke="#34d399" stroke-width="1.3" opacity=".65"/>
+          <circle cx="16" cy="16" r="12.5" fill="none" stroke="#7dd3fc" stroke-width="1" opacity=".35"/>
+        </svg>
+      </span>
+      <div>
+        <p class="eyebrow">Hakase 房间 · AI 小队</p>
+        <h1>Tailnet NOC</h1>
+      </div>
     </div>
-    <div class="hero-meta">
-      <div id="meta" class="meta-pill">加载中...</div>
-      <div id="clock" class="meta-sub"></div>
+    <nav class="topbar-meta" aria-label="状态总览">
+      <div class="stat-chip" data-tone="ok" id="chip-ok">
+        <span class="dot" aria-hidden="true"></span>
+        <span class="stat-num" id="stat-ok">--</span>
+        <span class="stat-label">在线</span>
+      </div>
+      <div class="stat-chip" data-tone="warn" id="chip-warn">
+        <span class="dot" aria-hidden="true"></span>
+        <span class="stat-num" id="stat-warn">--</span>
+        <span class="stat-label">告警</span>
+      </div>
+      <div class="stat-chip" data-tone="bad" id="chip-bad">
+        <span class="dot" aria-hidden="true"></span>
+        <span class="stat-num" id="stat-bad">--</span>
+        <span class="stat-label">离线</span>
+      </div>
+    </nav>
+    <div class="topbar-right">
+      <div id="banner" class="banner" role="status" aria-live="polite" hidden></div>
+      <div class="update-pill" id="meta" title="点击立即刷新" role="button" tabindex="0">
+        <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M12 6V3l4 4-4 4V8a5 5 0 1 0 5 5h2a7 7 0 1 1-7-7z"/></svg>
+        <span id="meta-text">加载中…</span>
+      </div>
     </div>
   </header>
-  <section id="summary" class="summary-grid" aria-label="小队总览"></section>
-  <main id="devices" class="device-grid"></main>
+
+  <section class="kpis" id="kpis" aria-label="舰队关键指标"></section>
+
+  <section class="subbar" aria-label="筛选与控制">
+    <div class="subbar-left">
+      <label class="search">
+        <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M10 4a6 6 0 1 1-4.243 10.243l-3.535 3.535-1.414-1.414 3.535-3.535A6 6 0 0 1 10 4zm0 2a4 4 0 1 0 0 8 4 4 0 0 0 0-8z"/></svg>
+        <input type="search" id="filter-text" placeholder="搜索设备名 / 主机 / IP / 备注…" autocomplete="off" spellcheck="false" />
+      </label>
+      <div class="seg" role="tablist" aria-label="按状态过滤">
+        <button class="seg-btn active" data-filter="all" role="tab" aria-selected="true">全部</button>
+        <button class="seg-btn" data-filter="ok" role="tab" aria-selected="false">在线</button>
+        <button class="seg-btn" data-filter="warn" role="tab" aria-selected="false">告警</button>
+        <button class="seg-btn" data-filter="bad" role="tab" aria-selected="false">离线</button>
+      </div>
+    </div>
+    <div class="subbar-right">
+      <span class="legend"><span class="dot dot-ok"></span>正常</span>
+      <span class="legend"><span class="dot dot-warn"></span>关注</span>
+      <span class="legend"><span class="dot dot-bad"></span>异常</span>
+      <span class="legend muted" id="legend-time">--</span>
+    </div>
+  </section>
+
+  <main id="devices" class="device-grid" aria-label="设备列表">
+    <section class="card device-card skeleton" aria-hidden="true">
+      <div class="card-head"><div class="sk sk-line w-50"></div><div class="sk sk-pill"></div></div>
+      <div class="sk sk-line w-90"></div>
+      <div class="sk sk-block"></div>
+      <div class="sk sk-block short"></div>
+    </section>
+    <section class="card device-card skeleton" aria-hidden="true">
+      <div class="card-head"><div class="sk sk-line w-50"></div><div class="sk sk-pill"></div></div>
+      <div class="sk sk-line w-90"></div>
+      <div class="sk sk-block"></div>
+      <div class="sk sk-block short"></div>
+    </section>
+    <section class="card device-card skeleton" aria-hidden="true">
+      <div class="card-head"><div class="sk sk-line w-50"></div><div class="sk sk-pill"></div></div>
+      <div class="sk sk-line w-90"></div>
+      <div class="sk sk-block"></div>
+      <div class="sk sk-block short"></div>
+    </section>
+  </main>
+
+  <footer class="footbar">
+    <span>API <code>/api/status</code></span>
+    <span class="sep">·</span>
+    <span id="foot-err" class="muted">无错误</span>
+  </footer>
+
   <template id="device-card">
-    <section class="card device-card">
-      <div class="card-head">
-        <div>
-          <h2></h2>
+    <section class="card device-card" data-state="">
+      <header class="card-head">
+        <div class="title-block">
+          <h2 class="title"></h2>
           <p class="notes"></p>
         </div>
-        <span class="badge"></span>
-      </div>
+        <div class="head-right">
+          <span class="badge"></span>
+          <span class="poll-interval" title="该设备单独轮询周期"></span>
+        </div>
+      </header>
       <div class="kv"></div>
-      <div class="quick-metrics"></div>
-      <div class="section-row compact-row"><h3>温度</h3><span class="section-hint">小温度计</span></div>
-      <div class="temps thermometer-grid"></div>
-      <div class="foldout">
-        <div class="section-row"><h3>资源趋势</h3><span class="section-hint">负载 / 磁盘 / 运行时间</span></div>
-        <div class="resources visual-grid"></div>
-        <div class="section-row"><h3>GPU / VRAM 详情</h3></div>
+      <section class="quick-metrics" aria-label="关键指标"></section>
+      <section class="metrics-row" aria-label="资源与负载">
+        <div class="block">
+          <h3 class="block-title"><span>资源</span><span class="muted small">磁盘 / 负载 / 运行时间</span></h3>
+          <div class="resources visual-grid"></div>
+        </div>
+        <div class="block">
+          <h3 class="block-title"><span>温度</span><span class="muted small">传感器</span></h3>
+          <div class="temps thermometer-grid"></div>
+        </div>
+      </section>
+      <section class="block">
+        <h3 class="block-title"><span>GPU / VRAM</span><span class="muted small">使用率 / 显存 / 温度</span></h3>
         <div class="gpu"></div>
-        <div class="section-row"><h3>模型活动</h3></div>
+      </section>
+      <section class="block">
+        <h3 class="block-title"><span>模型活动</span><span class="muted small">最近任务</span></h3>
         <div class="model-activity"></div>
-        <div class="section-row"><h3>服务 / 端口 / 健康</h3></div>
-        <div class="ops-grid"><div class="services"></div><div class="ports"></div><div class="health"></div></div>
-      </div>
+      </section>
+      <section class="block">
+        <h3 class="block-title"><span>服务 / 端口 / 健康检查</span><span class="muted small">systemd · 端口监听 · HTTP</span></h3>
+        <div class="ops-grid">
+          <div class="ops-cell"><div class="ops-label">服务</div><div class="services chip-row"></div></div>
+          <div class="ops-cell"><div class="ops-label">端口</div><div class="ports chip-row"></div></div>
+          <div class="ops-cell ops-health"><div class="ops-label">健康</div><div class="health chip-row"></div></div>
+        </div>
+      </section>
+      <footer class="card-foot">
+        <span class="checked-at"></span>
+        <span class="muted small" data-change></span>
+      </footer>
     </section>
   </template>
-  <script src="/app.js"></script>
+
+  <div id="toast" class="toast" role="alert" aria-live="assertive" hidden></div>
+  <script src="/app.js" defer></script>
 </body>
 </html>

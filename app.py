@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 STATIC_DIR = (BASE_DIR / "static").resolve()
 STATE_LOCK = threading.Lock()
-STATE: Dict[str, Any] = {"ok": False, "started_at": None, "updated_at": None, "poll_interval_seconds": None, "devices": [], "errors": []}
+STATE: Dict[str, Any] = {"ok": False, "started_at": None, "updated_at": None, "poll_interval_seconds": None, "poll_interval_min_seconds": None, "poll_interval_max_seconds": None, "devices": [], "errors": []}
 CONFIG: Dict[str, Any] = {}
 
 logger = logging.getLogger("raspi-tailnet-monitor")
@@ -82,7 +82,7 @@ def cpu_times():
 
 def cpu_percent():
     try:
-        i1, t1 = cpu_times(); time.sleep(0.2); i2, t2 = cpu_times()
+        i1, t1 = cpu_times(); time.sleep(0.10); i2, t2 = cpu_times()
         return round((1 - (i2 - i1) / max(1, t2 - t1)) * 100, 1)
     except Exception:
         return None
@@ -357,6 +357,21 @@ def ssh_probe(device: Dict[str, Any], monitor: Dict[str, Any]) -> Dict[str, Any]
     if key:
         cmd += ["-i", key]
     cmd += ["-o", "BatchMode=yes", "-o", f"ConnectTimeout={connect_timeout}"]
+    # Avoid high-frequency reconnects: keep a long-lived master socket per host
+    # so subsequent polls within the master's lifetime reuse the connection
+    # instead of paying the SSH handshake/Tailscale routing cost again.
+    control_dir = os.path.expanduser(monitor.get("ssh_control_dir", "~/.cache/raspi-tailnet-monitor/ssh-mux"))
+    try:
+        pathlib.Path(control_dir).mkdir(parents=True, exist_ok=True)
+        cmd += [
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPersist=120",
+            "-o", "ControlPath=" + os.path.join(control_dir, "%r@%h:%p"),
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=2",
+        ]
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("failed to set up ssh control dir %s: %s", control_dir, e)
     for opt in monitor.get("ssh_extra_options", []) or []:
         if isinstance(opt, str):
             cmd += ["-o", opt]
@@ -471,16 +486,41 @@ def check_device(device: Dict[str, Any], monitor: Dict[str, Any]) -> Dict[str, A
     return result
 
 
+def _device_interval_map(monitor: Dict[str, Any]) -> Dict[str, int]:
+    base = max(2, int(monitor.get("poll_interval_seconds", 60)))
+    monitor_only = max(
+        base,
+        int(monitor.get("monitor_only_interval_seconds", max(60, base * 4))),
+    )
+    out: Dict[str, int] = {}
+    for d in CONFIG.get("devices") or []:
+        if not isinstance(d, dict) or not d.get("name"):
+            continue
+        override = d.get("poll_interval_seconds")
+        if isinstance(override, (int, float)) and override > 0:
+            out[d["name"]] = max(2, int(override))
+        elif d.get("monitored_only"):
+            out[d["name"]] = monitor_only
+        else:
+            out[d["name"]] = base
+    return out
+
+
 def poll_once() -> Dict[str, Any]:
     monitor = CONFIG.get("monitor") or {}
     devices = CONFIG.get("devices") or []
+    interval_map = _device_interval_map(monitor)
+    base_interval = interval_map.get(next(iter(interval_map), ""), 60)
     results: List[Dict[str, Any]] = []
     errors: List[str] = []
     if not devices:
         return {
             "ok": True,
             "updated_at": now_iso(),
-            "poll_interval_seconds": monitor.get("poll_interval_seconds"),
+            "poll_interval_seconds": base_interval,
+            "poll_interval_min_seconds": base_interval,
+            "poll_interval_max_seconds": base_interval,
+            "poll_intervals": interval_map,
             "devices": [],
             "errors": [],
         }
@@ -499,25 +539,94 @@ def poll_once() -> Dict[str, Any]:
     return {
         "ok": not errors,
         "updated_at": now_iso(),
-        "poll_interval_seconds": monitor.get("poll_interval_seconds"),
+        "poll_interval_seconds": base_interval,
+        "poll_interval_min_seconds": min(interval_map.values()) if interval_map else base_interval,
+        "poll_interval_max_seconds": max(interval_map.values()) if interval_map else base_interval,
+        "poll_intervals": interval_map,
         "devices": results,
         "errors": errors,
     }
 
 
 def poll_loop() -> None:
-    interval = max(2, int(CONFIG.get("monitor", {}).get("poll_interval_seconds", 30)))
-    logger.info("poll loop started, interval=%ss", interval)
+    """Adaptive poll loop.
+
+    - Uses ``poll_interval_seconds`` as the base cadence.
+    - Devices marked ``monitored_only`` (e.g. recorder) are polled less
+      frequently to reduce load on the tailnet: their cycle is
+      ``max(base, monitor_only_interval_seconds)``.
+    - Per-device ``poll_interval_seconds`` overrides the global cadence.
+    """
+    monitor = CONFIG.get("monitor") or {}
+    interval_map = _device_interval_map(monitor)
+    base_interval = interval_map.get(next(iter(interval_map), ""), 60)
+    logger.info(
+        "poll loop started, base_interval=%ss, per-device intervals=%s",
+        base_interval,
+        interval_map,
+    )
+    last_poll: Dict[str, float] = {}
     while True:
         cycle_started = time.time()
         try:
-            snapshot = poll_once()
-            with STATE_LOCK:
-                STATE.update(snapshot)
+            now_ts = time.time()
+            interval_map = _device_interval_map(monitor)
+            eligible = [
+                d for d in (CONFIG.get("devices") or [])
+                if isinstance(d, dict) and d.get("name") and
+                (now_ts - last_poll.get(d["name"], 0.0)) >= interval_map.get(d["name"], base_interval) - 0.5
+            ]
+            if eligible:
+                results: List[Dict[str, Any]] = []
+                errors: List[str] = []
+                workers = min(8, max(1, len(eligible)))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                    futs = {pool.submit(check_device, d, monitor): d for d in eligible}
+                    for fut in concurrent.futures.as_completed(futs):
+                        d = futs[fut]
+                        try:
+                            res = fut.result()
+                            results.append(res)
+                            last_poll[d.get("name") or "?"] = now_ts
+                        except Exception as e:
+                            logger.exception("check_device failed for %s", d.get("name"))
+                            errors.append(f"{d.get('name') or '?'}: {e}")
+                with STATE_LOCK:
+                    prev_devices = list(STATE.get("devices") or [])
+                    new_by_name = {r.get("name"): r for r in results if r.get("name")}
+                    merged: List[Dict[str, Any]] = []
+                    for d in (CONFIG.get("devices") or []):
+                        nm = d.get("name") if isinstance(d, dict) else None
+                        if not nm:
+                            continue
+                        if nm in new_by_name:
+                            merged.append(new_by_name[nm])
+                        else:
+                            for prev in prev_devices:
+                                if prev.get("name") == nm:
+                                    merged.append(prev)
+                                    break
+                    order = {d.get("name"): i for i, d in enumerate(CONFIG.get("devices") or [])}
+                    merged.sort(key=lambda x: order.get(x.get("name"), 10 ** 9))
+                    STATE.update({
+                        "ok": not errors,
+                        "updated_at": now_iso(),
+                        "poll_interval_seconds": base_interval,
+                        "poll_interval_min_seconds": min(interval_map.values()) if interval_map else base_interval,
+                        "poll_interval_max_seconds": max(interval_map.values()) if interval_map else base_interval,
+                        "poll_intervals": dict(interval_map),
+                        "devices": merged,
+                        "errors": errors,
+                    })
+            else:
+                with STATE_LOCK:
+                    if not STATE.get("updated_at") or (time.time() - now_ts) > 60:
+                        STATE["updated_at"] = now_iso()
         except Exception:
             logger.exception("poll cycle crashed; keeping previous state")
         elapsed = time.time() - cycle_started
-        sleep_for = max(0.5, interval - elapsed)
+        next_tick = min(interval_map.values()) if interval_map else base_interval
+        sleep_for = max(0.5, next_tick - elapsed)
         time.sleep(sleep_for)
 
 
