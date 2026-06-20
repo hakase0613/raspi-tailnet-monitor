@@ -151,8 +151,20 @@
     tone = tone || "neutral";
     return '<span class="chip ' + tone + '"><span class="chip-dot" aria-hidden="true"></span><b>' + esc(label) + '</b>' + (detail ? '<small>' + esc(detail) + '</small>' : '') + '</span>';
   }
-  function emptyState(text, compact) {
-    return '<div class="empty-state' + (compact ? ' compact' : '') + '">' + esc(text) + '</div>';
+  // Empty-state helper.
+  // `tone` distinguishes three semantic categories so the card can surface the
+  // right hint to the user:
+  //   "skipped"     - SSH collection is intentionally disabled by config (class a)
+  //   "failed"      - SSH collection tried but failed (unreachable / auth / timeout, class b)
+  //   "unavailable" - SSH collection succeeded, but the device has no such hardware
+  //                   (no temperature sensor, no GPU, no model service, class c)
+  // Anything else falls back to a neutral grey note.
+  function emptyState(text, compact, tone) {
+    const t = tone || "neutral";
+    return '<div class="empty-state' + (compact ? ' compact' : '') + ' tone-' + t + '" data-empty-kind="' + t + '">'
+      + '<span class="empty-icon" aria-hidden="true"></span>'
+      + '<span class="empty-text">' + esc(text) + '</span>'
+      + '</div>';
   }
   function miniGauge(label, value, detail, warn, bad, abbr) {
     const v = num(value);
@@ -309,10 +321,22 @@
     if (legendTime) legendTime.textContent = cadence;
   }
 
-  function renderOps(container, items, kind) {
+  function renderOps(container, items, kind, sshState) {
     if (!container) return;
+    // SSH-level gating: if the SSH probe was skipped or failed for this device,
+    // we have no per-service/port/health data, so surface that explicitly
+    // rather than the misleading "暂无xxx".
+    if (sshState && sshState.skipped) {
+      container.innerHTML = emptyState("采集已按配置关闭", true, "skipped");
+      return;
+    }
+    if (sshState && sshState.failed) {
+      const err = (sshState.error || "").toString().split(/\r?\n/)[0] || "主机不可达";
+      container.innerHTML = emptyState("采集失败：" + (err.length > 80 ? err.slice(0, 80) + "…" : err), true, "failed");
+      return;
+    }
     if (!items || !items.length) {
-      container.innerHTML = emptyState("暂无" + kind, true);
+      container.innerHTML = emptyState("该设备未配置" + kind, true, "unavailable");
       return;
     }
     container.innerHTML = "";
@@ -329,34 +353,65 @@
     });
   }
 
-  function renderTemps(elm, temps) {
+  function renderTemps(elm, temps, sshState) {
     if (!elm) return;
+    // SSH-level gates: do NOT show "无温度传感器" when the real reason is that
+    // SSH never reported in. That confuses the user into thinking the device
+    // has no hwmon while in fact we just couldn't read /sys.
+    if (sshState && sshState.skipped) {
+      elm.innerHTML = emptyState("采集已按配置关闭", false, "skipped");
+      return;
+    }
+    if (sshState && sshState.failed) {
+      const err = (sshState.error || "").toString().split(/\r?\n/)[0] || "主机不可达";
+      elm.innerHTML = emptyState("采集失败：" + (err.length > 80 ? err.slice(0, 80) + "…" : err), false, "failed");
+      return;
+    }
     if (!temps || !temps.length) {
-      elm.innerHTML = emptyState("暂无温度传感器");
+      elm.innerHTML = emptyState("无温度传感器（设备无 /sys/class/thermal 或 hwmon 读数）", false, "unavailable");
       return;
     }
     elm.innerHTML = temps.slice(0, 8).map(t => t ? thermometer(t.label || "传感器", num(t.temp_c), t.source || "") : "").join("");
   }
 
-  function renderQuickMetrics(elm, d, name) {
+  function renderQuickMetrics(elm, d, name, sshState) {
     if (!elm) return;
+    if (sshState && sshState.skipped) {
+      elm.innerHTML = emptyState("采集已按配置关闭", false, "skipped");
+      return;
+    }
+    if (sshState && sshState.failed) {
+      const err = (sshState.error || "").toString().split(/\r?\n/)[0] || "主机不可达";
+      elm.innerHTML = emptyState("采集失败：" + (err.length > 80 ? err.slice(0, 80) + "…" : err), false, "failed");
+      return;
+    }
     if (!d) {
-      elm.innerHTML = emptyState("暂无资源数据（SSH 未连通）", true);
+      elm.innerHTML = emptyState("暂无可采集的资源数据", false, "neutral");
       return;
     }
     const g = (d.gpu && d.gpu.gpus && d.gpu.gpus[0]) || {};
     const loadVal = (d.loadavg || [])[0];
+    const gpuAvailable = !!(d.gpu && d.gpu.available);
     elm.innerHTML = [
       miniGauge("CPU", d.cpu_percent, "负载 " + (loadVal == null ? "--" : loadVal), 70, 88, "CPU"),
       miniGauge("内存", d.memory && d.memory.used_percent, fmtBytes(d.memory && d.memory.used) + " / " + fmtBytes(d.memory && d.memory.total), 70, 88, "内存"),
-      miniGauge("GPU", g.utilization_gpu_percent, d.gpu && d.gpu.available ? (g.name || "GPU") : (d.gpu && d.gpu.error ? "未检测" : "未检测"), 70, 88, "GPU"),
-      miniGauge("VRAM", g.memory_used_percent, d.gpu && d.gpu.available ? (g.memory_used_mib + " / " + g.memory_total_mib + " MiB") : "未检测", 78, 92, "VRAM")
+      miniGauge("GPU", g.utilization_gpu_percent, gpuAvailable ? (g.name || "GPU") : "该设备无 GPU", 70, 88, "GPU"),
+      miniGauge("VRAM", g.memory_used_percent, gpuAvailable ? (g.memory_used_mib + " / " + g.memory_total_mib + " MiB") : "该设备无 GPU", 78, 92, "VRAM")
     ].join("");
   }
 
-  function renderModelActivity(elm, items) {
+  function renderModelActivity(elm, items, sshState) {
     if (!elm) return;
-    if (!items || !items.length) { elm.innerHTML = emptyState("暂无配置模型服务"); return; }
+    if (sshState && sshState.skipped) {
+      elm.innerHTML = emptyState("采集已按配置关闭", false, "skipped");
+      return;
+    }
+    if (sshState && sshState.failed) {
+      const err = (sshState.error || "").toString().split(/\r?\n/)[0] || "主机不可达";
+      elm.innerHTML = emptyState("采集失败：" + (err.length > 80 ? err.slice(0, 80) + "…" : err), false, "failed");
+      return;
+    }
+    if (!items || !items.length) { elm.innerHTML = emptyState("该设备未配置模型服务", false, "unavailable"); return; }
     elm.innerHTML = "";
     items.forEach(item => {
       if (!item) return;
@@ -364,7 +419,7 @@
       const box = el("article", "activity-card");
       if (!last) {
         box.innerHTML = '<div class="activity-title"><b>' + esc(item.label || item.service || "模型") + '</b><span>' + esc(item.service || "") + '</span></div>'
-          + emptyState(item.note || item.error || "暂无最近调用", true);
+          + emptyState(item.note || item.error || "暂无最近调用", true, "neutral");
       } else {
         const evalT = num(last.eval_tokens_per_second);
         const total = num(last.total_ms);
@@ -454,23 +509,38 @@
 
     // body sections
     const d = dev.ssh && dev.ssh.data;
-    renderQuickMetrics(node.querySelector(".quick-metrics"), d, dev.name);
+    // Compute a single normalized "ssh state" so EVERY block (quick-metrics,
+    // resources, temps, gpu, model, services, ports, health) can render
+    // consistently whether this is the local coordinator or a remote peer.
+    // The same code path is used regardless of `is_self` — only the badge
+    // and network chip differ for the local host.
+    const sshState = {
+      skipped: !!(dev.ssh && dev.ssh.skipped),
+      failed: !!(dev.ssh && !dev.ssh.ok),
+      error: (dev.ssh && dev.ssh.error) || ""
+    };
+    renderQuickMetrics(node.querySelector(".quick-metrics"), d, dev.name, sshState);
     const resources = node.querySelector(".resources");
-    if (d) {
+    if (sshState.skipped) {
+      resources.innerHTML = emptyState("采集已按配置关闭", false, "skipped");
+    } else if (sshState.failed) {
+      const err = (sshState.error || "").toString().split(/\r?\n/)[0] || "主机不可达";
+      resources.innerHTML = emptyState("采集失败：" + (err.length > 80 ? err.slice(0, 80) + "…" : err), false, "failed");
+    } else if (d) {
       const loadHist = hist(dev.name, "load");
       resources.innerHTML = [
         gaugeCard("磁盘 /", d.disk_root && d.disk_root.used_percent, fmtBytes(d.disk_root && d.disk_root.used) + " / " + fmtBytes(d.disk_root && d.disk_root.total), 70, 90),
         '<article class="chart-card"><b>负载趋势</b>' + spark(loadHist, "负载历史") + '<small>运行 ' + fmtUptime(d.uptime_seconds) + ' · ' + esc(d.hostname || "") + '</small></article>'
       ].join("");
     } else {
-      resources.innerHTML = emptyState("暂无 SSH 资源数据");
+      resources.innerHTML = emptyState("暂无可采集的资源数据", false, "neutral");
     }
-    renderTemps(node.querySelector(".temps"), d && d.temperatures);
-    renderGpuWithName(node.querySelector(".gpu"), d && d.gpu, dev.name);
-    renderModelActivity(node.querySelector(".model-activity"), d && d.model_activity);
-    renderOps(node.querySelector(".services"), d && d.services, "服务");
-    renderOps(node.querySelector(".ports"), d && d.ports, "端口");
-    renderOps(node.querySelector(".health"), dev.health, "健康");
+    renderTemps(node.querySelector(".temps"), d && d.temperatures, sshState);
+    renderGpuWithName(node.querySelector(".gpu"), d && d.gpu, dev.name, sshState);
+    renderModelActivity(node.querySelector(".model-activity"), d && d.model_activity, sshState);
+    renderOps(node.querySelector(".services"), d && d.services, "服务", sshState);
+    renderOps(node.querySelector(".ports"), d && d.ports, "端口", sshState);
+    renderOps(node.querySelector(".health"), dev.health, "健康", sshState);
 
     // card foot
     const checkedAt = node.querySelector(".checked-at");
@@ -498,14 +568,27 @@
     return node;
   }
 
-  function renderGpuWithName(elm, gpu, name) {
+  function renderGpuWithName(elm, gpu, name, sshState) {
     if (!elm) return;
+    if (sshState && sshState.skipped) {
+      elm.innerHTML = emptyState("采集已按配置关闭", false, "skipped");
+      return;
+    }
+    if (sshState && sshState.failed) {
+      const err = (sshState.error || "").toString().split(/\r?\n/)[0] || "主机不可达";
+      elm.innerHTML = emptyState("采集失败：" + (err.length > 80 ? err.slice(0, 80) + "…" : err), false, "failed");
+      return;
+    }
     if (!gpu || !gpu.available) {
-      elm.innerHTML = emptyState(gpu && gpu.error ? ("无 GPU: " + gpu.error) : "该设备无 GPU / 未检测到 nvidia-smi");
+      // SSH ran cleanly but the device simply has no NVIDIA GPU. This is a
+      // normal absence (e.g. coordinator/recorder) and must NOT be styled
+      // as an error — only the `unavailable` tone communicates "正常没有".
+      const reason = gpu && gpu.error ? ("未检测到 nvidia-smi：" + (gpu.error || "").split(/\r?\n/)[0]) : "该设备无 GPU / 未安装 nvidia-smi";
+      elm.innerHTML = emptyState(reason, false, "unavailable");
       return;
     }
     const list = gpu.gpus || [];
-    if (!list.length) { elm.innerHTML = emptyState("GPU 信息为空"); return; }
+    if (!list.length) { elm.innerHTML = emptyState("GPU 信息为空", false, "unavailable"); return; }
     const wrap = el("div", "gpu-grid");
     list.forEach((g, i) => {
       if (!g) return;
