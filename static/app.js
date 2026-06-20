@@ -6,6 +6,7 @@
   const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
 
   const devicesEl = $("#devices");
+  const tabsEl = $("#device-tabs");
   const metaEl = $("#meta");
   const metaText = $("#meta-text");
   const summaryEl = $("#kpis");
@@ -42,6 +43,35 @@
   let inFlight = false;
   let pendingForce = false;      // a manual refresh was requested while a request was in-flight
   let firstLoad = true;
+  /* ---------- tab state ---------- */
+  const ROLE_LABELS = {
+    doer: "行动派工程少女",
+    supervisor: "冷静严格质量审查官",
+    coordinator: "温柔书记官 / 文档管理员",
+    recorder: "备份归档（不参与 OpenClaw）"
+  };
+  /* ---------- iter3: sparkline buffers + offline tracking ---------- */
+  // In-memory ring buffers keyed by `${devName}|cpu` and `${devName}|gpu0`,
+  // `${devName}|gpu1`, ... storing up to 60 numeric samples. No persistence.
+  const SPARK_MAX = 60;
+  const sparkBuffers = new Map();
+  // First time we observed an SSH collection failure per device. Reset to null
+  // when SSH succeeds again, so the offline counter restarts from 0.
+  const firstSeenSshFail = new Map();
+  function roleLabelFor(dev) {
+    if (!dev) return "节点";
+    const name = String(dev.name || "").trim();
+    if (name && ROLE_LABELS[name]) return ROLE_LABELS[name];
+    const notes = String(dev.notes || "").trim();
+    if (notes) return notes.length > 24 ? notes.slice(0, 24) + "…" : notes;
+    return "节点";
+  }
+  const tabState = new Map();    // name -> { tone, role, btn, card, available }
+  let activeDevice = null;       // currently selected device name
+  let suppressHash = false;      // set to true while programmatically setting hash to avoid loops
+  /* per-device manual refresh debounce */
+  const REFRESH_DEBOUNCE_MS = 3000;
+  const refreshLocks = new Map(); // name -> { until: ms }
   /* ---------- task board state ---------- */
   let taskRefreshTimer = null;
   let taskInFlight = false;
@@ -98,6 +128,7 @@
     if (lower === "mem") return "显存 (mem)";
     if (lower.indexOf("composite") >= 0) return "NVMe Composite";
     if (lower.indexOf("nvme") >= 0) return "NVMe 固态";
+    if (lower.indexOf("zenpower") >= 0) return "CPU 核心 (zenpower)";
     if (lower === "acpitz" || lower === "x86_pkg_temp" || lower.indexOf("acpitz") >= 0 || lower.indexOf("x86_pkg_temp") >= 0) return "主板/封装";
     return s;
   }
@@ -109,6 +140,7 @@
     const lower = String(raw == null ? "" : raw).toLowerCase();
     if (!lower) return { group: 99, key: "misc" };
     if (lower.indexOf("tctl") >= 0 || lower.indexOf("k10temp") >= 0) return { group: 1, key: "cpu-tctl" };
+    if (lower.indexOf("zenpower") >= 0) return { group: 1, key: "cpu-zenpower" };
     if (lower.indexOf("tdie") >= 0) return { group: 1, key: "cpu-tdie" };
     if (lower.indexOf("coretemp") >= 0 || lower.indexOf("package id") >= 0) return { group: 1, key: "cpu-pkg" };
     if (/(^|[^a-z])core\s*\d+/i.test(lower) || lower === "core") return { group: 1, key: "cpu-core-" + lower };
@@ -130,9 +162,21 @@
       const c = num(t.temp_c);
       const human = humanTempLabel(t.label || "传感器");
       const bucket = tempBucket(t.label || "");
-      const key = bucket.key + "|" + human;
+      // Additional normalized label key so case/whitespace-equivalent labels
+      // (e.g. "Tctl", "tctl ", "TCTL") collapse to the same bucket regardless
+      // of which /sys path they came from.
+      const normLabel = (t.label || "").trim().toLowerCase().replace(/\s+/g, "");
+      const key = bucket.key + "|" + human + "|" + normLabel;
       if (!map.has(key)) {
-        map.set(key, { label: t.label || "传感器", human, group: bucket.group, temp_c: c, source: t.source || "", merged: 1 });
+        map.set(key, {
+          label: t.label || "传感器",
+          human,
+          group: bucket.group,
+          temp_c: c,
+          source: t.source || "",
+          sources: t.source ? [t.source] : [],
+          merged: 1
+        });
         order.push(key);
         return;
       }
@@ -142,6 +186,13 @@
         cur.temp_c = c;
         cur.label = t.label || cur.label;
         cur.source = t.source || cur.source;
+      }
+      // Accumulate the full list of source paths for this merged reading so
+      // power users can still see which /sys files contributed. Dedupe so we
+      // don't grow the array when the same path appears twice in one poll.
+      if (t.source) {
+        if (!Array.isArray(cur.sources)) cur.sources = [];
+        if (cur.sources.indexOf(t.source) < 0) cur.sources.push(t.source);
       }
     });
     const out = order.map(k => map.get(k));
@@ -275,6 +326,66 @@
     };
   }
 
+  /* ---------- iter3 helpers: sparklines / sort buckets / duration ---------- */
+  function pushSparkSample(key, value) {
+    const v = num(value);
+    if (v == null) return;
+    let arr = sparkBuffers.get(key);
+    if (!arr) { arr = []; sparkBuffers.set(key, arr); }
+    arr.push(v);
+    if (arr.length > SPARK_MAX) arr.splice(0, arr.length - SPARK_MAX);
+  }
+  function sparklineSvg(values, opts) {
+    const arr = (values || []).map(num).filter(v => v != null);
+    if (!arr.length) return "";
+    const w = 80, h = 16;
+    const stroke = (opts && opts.stroke) || "#4ade80";
+    // Normalize each sample to 0..100 (clamped). The polyline maps high
+    // utilization to the top of the canvas and low to the bottom.
+    const minV = (opts && opts.min != null) ? opts.min : 0;
+    const maxV = (opts && opts.max != null) ? opts.max : 100;
+    const span = (maxV - minV) || 1;
+    const step = arr.length > 1 ? (w - 2) / (arr.length - 1) : 0;
+    const pts = arr.map((v, i) => {
+      const norm = Math.max(0, Math.min(1, (v - minV) / span));
+      const x = 1 + i * step;
+      const y = h - 1 - norm * (h - 2);
+      return x.toFixed(1) + "," + y.toFixed(1);
+    }).join(" ");
+    return '<svg class="mini-spark" width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '" aria-hidden="true">'
+      + '<polyline fill="none" stroke="' + stroke + '" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" points="' + pts + '"/>'
+      + '</svg>';
+  }
+  function humanDuration(sec) {
+    const s = Math.max(0, Math.floor(num(sec) == null ? 0 : sec));
+    if (s < 60) return s + "s";
+    if (s < 3600) {
+      const m = Math.floor(s / 60);
+      const rem = s % 60;
+      return m + "m" + rem + "s";
+    }
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    return h + "h" + m + "m";
+  }
+  /**
+   * Stable-sort bucket for the device list. Lower bucket = shown earlier.
+   *   0  self / local host
+   *   1  ssh collection failed (collection itself failed)
+   *   2  partial hardware missing (ssh ok but no usable data — no gpu and no temps)
+   *   3  everything else (all-green idle / loaded)
+   */
+  function deviceSortBucket(dev) {
+    if (!dev) return 3;
+    const network = (dev.network || (dev.tailscale && dev.tailscale.network) || "");
+    if (dev.is_self === true || network === "local") return 0;
+    const ssh = dev.ssh || {};
+    if (ssh.ok === false) return 1;
+    const d = ssh.data;
+    if (ssh.ok === true && (!d || (d.gpu && d.gpu.available === false) && (!Array.isArray(d.temperatures) || d.temperatures.length === 0))) return 2;
+    return 3;
+  }
+
   /* ---------- builders ---------- */
   function el(tag, cls) { const e = document.createElement(tag); if (cls) e.className = cls; return e; }
   function setHTML(parent, html) { parent.innerHTML = html; }
@@ -374,7 +485,232 @@
       + '<path class="area" d="' + area + '"/><polyline points="' + pts + '"/></svg>';
   }
 
-  /* ---------- per-device persistence ---------- */
+  /* ---------- per-device manual refresh ---------- */
+  // POST /api/devices/<name>/refresh, with a 3-second debounce per device.
+  // The button is disabled + shows "刷新中…" while in flight, and a successful
+  // call schedules an immediate refreshStatus() so the rest of the dashboard
+  // picks up the new numbers without waiting for the next periodic tick.
+  async function triggerDeviceRefresh(name, btn) {
+    if (!name) return;
+    const now = Date.now();
+    const lock = refreshLocks.get(name) || { until: 0 };
+    if (lock.until > now) {
+      // Within debounce window — silently ignore extra clicks.
+      return;
+    }
+    refreshLocks.set(name, { until: now + REFRESH_DEBOUNCE_MS });
+    if (btn) {
+      btn.disabled = true;
+      btn.classList.add("loading");
+      const lbl = btn.querySelector(".refresh-label");
+      if (lbl) lbl.textContent = "刷新中…";
+    }
+    try {
+      const resp = await fetch("/api/devices/" + encodeURIComponent(name) + "/refresh", {
+        method: "POST",
+        headers: { "Accept": "application/json", "X-Requested-With": "noc" },
+        credentials: "same-origin"
+      });
+      if (!resp.ok) {
+        let msg = "HTTP " + resp.status;
+        try {
+          const body = await resp.json();
+          if (body && body.error) msg = body.error;
+        } catch (_) { /* ignore */ }
+        showToast("刷新失败: " + msg);
+        return;
+      }
+      // Consume the body but we don't merge it into local state — the next
+      // refresh() pull from /api/status will pick it up naturally and keeps
+      // the per-card UX consistent with periodic ticks.
+      try { await resp.json(); } catch (_) { /* tolerate empty body */ }
+      // Re-pull /api/status right away so the user sees fresh numbers without
+      // waiting for the periodic timer. Use force=true semantics by calling
+      // refresh() (it will honor inFlight debouncing).
+      refresh(true);
+    } catch (e) {
+      showToast("刷新失败: " + (e && e.message ? e.message : e));
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.classList.remove("loading");
+        const lbl = btn.querySelector(".refresh-label");
+        if (lbl) lbl.textContent = "立即刷新";
+      }
+    }
+  }
+
+  /* ---------- tabs ---------- */
+  function buildDeviceTab(name) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "device-tab";
+    btn.setAttribute("role", "tab");
+    btn.setAttribute("data-device", name || "");
+    btn.setAttribute("aria-selected", "false");
+    btn.setAttribute("tabindex", "-1");
+    btn.setAttribute("aria-controls", "device-card-" + (name || ""));
+    btn.hidden = true;
+    btn.innerHTML = '<span class="tab-dot" data-tone="unknown" aria-hidden="true"></span>'
+      + '<span class="tab-name"></span>'
+      + '<span class="tab-role"></span>';
+    btn.addEventListener("click", () => {
+      if (!name) return;
+      setActiveDevice(name, { fromUser: true });
+    });
+    btn.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        if (name) setActiveDevice(name, { fromUser: true });
+      } else if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+        e.preventDefault();
+        moveTabFocus(e.key === "ArrowRight" ? 1 : -1);
+      }
+    });
+    return btn;
+  }
+  function moveTabFocus(direction) {
+    const order = visibleDeviceOrder();
+    if (!order.length) return;
+    const cur = order.indexOf(activeDevice);
+    const idx = cur < 0 ? 0 : (cur + direction + order.length) % order.length;
+    const next = order[idx];
+    setActiveDevice(next, { fromUser: true });
+    const btn = tabState.get(next) && tabState.get(next).btn;
+    if (btn) btn.focus();
+  }
+  function visibleDeviceOrder() {
+    // Order of devices currently visible (passes both filter and search).
+    // Falls back to last-known order from lastData so the tab order stays
+    // stable even if a device is briefly hidden.
+    if (lastData && Array.isArray(lastData.devices)) {
+      return lastData.devices
+        .filter(d => d && matchesFilter(d) && matchesText(d))
+        .map(d => d.name)
+        .filter(Boolean);
+    }
+    return Array.from(tabState.keys());
+  }
+  function syncTabs(data) {
+    if (!tabsEl) return;
+    const devs = (data && Array.isArray(data.devices)) ? data.devices.filter(Boolean) : [];
+    const seen = new Set();
+    devs.forEach(d => {
+      const name = d.name || "?";
+      seen.add(name);
+      let entry = tabState.get(name);
+      if (!entry) {
+        const btn = buildDeviceTab(name);
+        tabsEl.appendChild(btn);
+        entry = { btn, tone: "unknown", role: "", available: false };
+        tabState.set(name, entry);
+      }
+      const tone = deviceTone(d);
+      entry.tone = tone;
+      entry.role = roleLabelFor(d);
+      const dot = entry.btn.querySelector(".tab-dot");
+      if (dot) dot.setAttribute("data-tone", tone);
+      const nm = entry.btn.querySelector(".tab-name");
+      if (nm) nm.textContent = name;
+      const role = entry.btn.querySelector(".tab-role");
+      if (role) role.textContent = entry.role;
+    });
+    // Remove tabs whose device is no longer present in /api/status.
+    Array.from(tabState.entries()).forEach(([n, entry]) => {
+      if (!seen.has(n)) {
+        if (entry.btn && entry.btn.parentNode) entry.btn.parentNode.removeChild(entry.btn);
+        tabState.delete(n);
+        if (activeDevice === n) activeDevice = null;
+      }
+    });
+    applyFilterToTabs();
+  }
+  function applyFilterToTabs() {
+    // Show/hide tabs based on activeFilter + activeText. Hidden tabs do not
+    // become the active device even if they were previously selected.
+    const order = (lastData && Array.isArray(lastData.devices))
+      ? lastData.devices.filter(Boolean)
+      : Array.from(tabState.keys()).map(n => ({ name: n }));
+    let firstVisible = null;
+    order.forEach(d => {
+      const entry = tabState.get(d.name);
+      if (!entry) return;
+      const pass = matchesFilter(d) && matchesText(d);
+      entry.btn.hidden = !pass;
+      entry.btn.setAttribute("aria-hidden", pass ? "false" : "true");
+      if (pass && !firstVisible) firstVisible = d.name;
+    });
+    // If activeDevice got filtered out, fall back to the first visible tab.
+    const cur = tabState.get(activeDevice);
+    if (!cur || cur.btn.hidden) {
+      if (firstVisible) {
+        setActiveDevice(firstVisible, { fromUser: false });
+      } else {
+        // Nothing visible at all: hide every card so the user doesn't see
+        // a stale active device's card with no matching tab.
+        tabState.forEach((entry) => {
+          if (entry.card) entry.card.setAttribute("hidden", "");
+          if (entry.btn) {
+            entry.btn.setAttribute("aria-selected", "false");
+            entry.btn.classList.remove("active");
+            entry.btn.setAttribute("tabindex", "-1");
+          }
+        });
+        activeDevice = null;
+      }
+    }
+  }
+  function setActiveDevice(name, opts) {
+    if (!name) return;
+    const opts2 = opts || {};
+    // Hide every card, show only the chosen one. Reuse DOM to avoid flicker.
+    tabState.forEach((entry, n) => {
+      if (!entry.btn) return;
+      const isActive = n === name;
+      entry.btn.setAttribute("aria-selected", isActive ? "true" : "false");
+      entry.btn.classList.toggle("active", isActive);
+      entry.btn.setAttribute("tabindex", isActive ? "0" : "-1");
+      if (entry.card) {
+        if (isActive) entry.card.removeAttribute("hidden");
+        else entry.card.setAttribute("hidden", "");
+      }
+    });
+    activeDevice = name;
+    // Scroll the tab into view on mobile.
+    const entry = tabState.get(name);
+    if (entry && entry.btn && typeof entry.btn.scrollIntoView === "function" && opts2.fromUser) {
+      try { entry.btn.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "smooth" }); } catch (_) { /* ignore */ }
+    }
+    // Sync the URL hash (best-effort). Avoid loops when we set the hash.
+    if (opts2.fromUser) {
+      suppressHash = true;
+      try {
+        const newHash = "#/device/" + encodeURIComponent(name);
+        if (location.hash !== newHash) {
+          if (history && history.replaceState) {
+            history.replaceState(null, "", newHash);
+          } else {
+            location.hash = newHash;
+          }
+        }
+      } finally {
+        // Defer clearing the flag past the synchronous hashchange handler.
+        setTimeout(() => { suppressHash = false; }, 0);
+      }
+    }
+  }
+  function syncActiveFromHash() {
+    if (!location.hash) return false;
+    const m = location.hash.match(/^#\/device\/([A-Za-z0-9_.-]+)/);
+    if (!m) return false;
+    const name = decodeURIComponent(m[1]);
+    if (tabState.has(name)) {
+      setActiveDevice(name, { fromUser: false });
+      return true;
+    }
+    return false;
+  }
+
   function remember(dev) {
     if (!dev || !dev.name) return;
     const d = dev.ssh && dev.ssh.data || {};
@@ -507,8 +843,9 @@
     });
   }
 
-  function renderTemps(elm, temps, sshState) {
+  function renderTemps(elm, temps, sshState, deviceName) {
     if (!elm) return;
+    const devPrefix = deviceName ? (deviceName + " · ") : "";
     // SSH-level gates: do NOT show "无温度传感器" when the real reason is that
     // SSH never reported in. That confuses the user into thinking the device
     // has no hwmon while in fact we just couldn't read /sys.
@@ -522,7 +859,7 @@
       return;
     }
     if (!temps || !temps.length) {
-      elm.innerHTML = emptyState("无温度传感器（设备无 /sys/class/thermal 或 hwmon 读数）", false, "unavailable");
+      elm.innerHTML = emptyState(devPrefix + "无温度传感器（设备无 /sys/class/thermal 或 hwmon 读数）", false, "unavailable");
       return;
     }
     // Use humanTempLabel to translate raw sensor labels (Tctl / edge / mem / ...)
@@ -530,11 +867,17 @@
     // power users who want to know which /sys file this came from. Same label
     // appearing through multiple hwmon paths is merged via dedupeTemps() to
     // the hottest reading and rendered in CPU → iGPU → NVIDIA → other order.
+    //
+    // Each thermometer's friendly label is prefixed with "<设备名> · " so that
+    // multiple devices' temps are unambiguously tagged when scanned at a glance
+    // (e.g. "doer · CPU 温度 53.9°C", "supervisor · 主板/封装 45°C"). The
+    // thermometer's <b> shows the prefixed name and the numeric <strong>
+    // carries the actual °C value.
     const merged = dedupeTemps(temps).slice(0, 8);
     elm.innerHTML = merged.map(t => {
       if (!t) return "";
       const detail = (t.merged > 1 ? "合并 " + t.merged + " 路 · " : "") + (t.source || "");
-      return thermometer(t.label || "传感器", num(t.temp_c), detail);
+      return thermometer(devPrefix + (t.label || "传感器"), num(t.temp_c), detail);
     }).join("");
   }
 
@@ -556,8 +899,16 @@
     const g = (d.gpu && d.gpu.gpus && d.gpu.gpus[0]) || {};
     const loadVal = (d.loadavg || [])[0];
     const gpuAvailable = !!(d.gpu && d.gpu.available);
+    // Push the latest CPU sample into the per-device spark buffer so the
+    // next render can show a trend line next to the % number.
+    if (name) pushSparkSample(name + "|cpu", d.cpu_percent);
+    const cpuSpark = name ? sparklineSvg(sparkBuffers.get(name + "|cpu") || []) : "";
+    const cpuGauge = miniGauge("CPU", d.cpu_percent, "负载 " + (loadVal == null ? "--" : loadVal), 70, 88, "CPU");
+    const cpuWithSpark = cpuSpark
+      ? cpuGauge.replace('<div class="dial-text">', '<div class="dial-text">' + cpuSpark)
+      : cpuGauge;
     elm.innerHTML = [
-      miniGauge("CPU", d.cpu_percent, "负载 " + (loadVal == null ? "--" : loadVal), 70, 88, "CPU"),
+      cpuWithSpark,
       miniGauge("内存", d.memory && d.memory.used_percent, fmtBytes(d.memory && d.memory.used) + " / " + fmtBytes(d.memory && d.memory.total), 70, 88, "内存"),
       miniGauge("GPU", g.utilization_gpu_percent, gpuAvailable ? (g.name || "GPU") : "该设备无 GPU", 70, 88, "GPU"),
       miniGauge("VRAM", g.memory_used_percent, gpuAvailable ? (g.memory_used_mib + " / " + g.memory_total_mib + " MiB") : "该设备无 GPU", 78, 92, "VRAM")
@@ -610,6 +961,7 @@
     const tone = deviceTone(dev);
     node.setAttribute("data-state", tone);
     node.dataset.name = dev.name || "";
+    if (dev.name) node.id = "device-card-" + dev.name;
     node.querySelector(".title").textContent = dev.name || "未命名";
     node.querySelector(".notes").textContent = dev.notes || "";
     const badge = node.querySelector(".badge");
@@ -699,12 +1051,24 @@
     } else {
       resources.innerHTML = emptyState("暂无可采集的资源数据", false, "neutral");
     }
-    renderTemps(node.querySelector(".temps"), d && d.temperatures, sshState);
+    renderTemps(node.querySelector(".temps"), d && d.temperatures, sshState, dev.name);
     renderGpuWithName(node.querySelector(".gpu"), d && d.gpu, dev.name, sshState);
     renderModelActivity(node.querySelector(".model-activity"), d && d.model_activity, sshState);
     renderOps(node.querySelector(".services"), d && d.services, "服务", sshState);
     renderOps(node.querySelector(".ports"), d && d.ports, "端口", sshState);
     renderOps(node.querySelector(".health"), dev.health, "健康", sshState);
+
+    // Per-card "立即刷新" button: bound lazily (only once per DOM node) so
+    // re-renders on the same node don't keep stacking listeners.
+    const refreshBtn = node.querySelector("[data-refresh-btn]");
+    if (refreshBtn && !refreshBtn.dataset.bound) {
+      refreshBtn.dataset.bound = "1";
+      refreshBtn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        triggerDeviceRefresh(dev.name, refreshBtn);
+      });
+    }
 
     // card foot
     const checkedAt = node.querySelector(".checked-at");
@@ -766,11 +1130,19 @@
       const utilDetail = computeIdle
         ? ("显存占用 " + memUsedMib + " MiB（计算空闲）")
         : ((g.power_w || "--") + "W · " + (temp == null ? "--" : (temp + "°C")));
+      // Push the latest GPU utilization into the per-device spark buffer so
+      // the next render can show a trend line next to the GPU% number.
+      if (name) pushSparkSample(name + "|gpu" + i, gpuUtil);
+      const gpuSpark = name ? sparklineSvg(sparkBuffers.get(name + "|gpu" + i) || []) : "";
+      const gpuGauge = gaugeCard("GPU", gpuUtil, utilDetail);
+      const gpuWithSpark = gpuSpark
+        ? gpuGauge.replace('<div class="gauge-text">', '<div class="gauge-text">' + gpuSpark)
+        : gpuGauge;
       wrap.insertAdjacentHTML("beforeend",
         '<article class="gpu-card" data-compute-idle="' + (computeIdle ? 1 : 0) + '">'
         + '<div class="gpu-title"><b>' + esc(g.name || ("GPU " + i)) + '</b><small>驱动 ' + esc(g.driver || "--") + '</small></div>'
         + '<div class="visual-grid">'
-        + gaugeCard("GPU", gpuUtil, utilDetail)
+        + gpuWithSpark
         + gaugeCard("VRAM", vram, (g.memory_used_mib || "--") + " / " + (g.memory_total_mib || "--") + " MiB", 78, 92)
         + '</div>'
         + spark(hist(name, "gpu"), "GPU 使用率历史")
@@ -1024,8 +1396,25 @@
   function renderList(data) {
     if (!data || !Array.isArray(data.devices)) return;
     const devs = data.devices.filter(Boolean);
-    const visible = devs.filter(d => matchesFilter(d) && matchesText(d));
-    // Reuse existing card DOM by name to avoid full repaint
+    // Stable-sort devices so the most relevant ones bubble to the top:
+    //   bucket 0 = self / local
+    //   bucket 1 = ssh collection failed
+    //   bucket 2 = partial hardware missing (ssh ok but no usable data)
+    //   bucket 3 = everything else (all-green idle or loaded)
+    // Within a bucket we sort by name (case-insensitive).
+    devs.sort(function (a, b) {
+      const ba = deviceSortBucket(a);
+      const bb = deviceSortBucket(b);
+      if (ba !== bb) return ba - bb;
+      const na = String((a && a.name) || "").toLowerCase();
+      const nb = String((b && b.name) || "").toLowerCase();
+      if (na < nb) return -1;
+      if (na > nb) return 1;
+      return 0;
+    });
+    // Reuse existing card DOM by name to avoid full repaint. We always render
+    // every device's card (not just the currently active one) so tab switching
+    // is instant — only the `hidden` attribute on the card is toggled.
     const existing = new Map();
     $$(".device-card", devicesEl).forEach(c => { if (c.dataset && c.dataset.name) existing.set(c.dataset.name, c); });
     const seen = new Set();
@@ -1033,8 +1422,9 @@
     if (firstLoad) {
       $$(".skeleton", devicesEl).forEach(s => s.remove());
     }
-    // Build new ordering
-    visible.forEach(dev => {
+    // Sync tab bar BEFORE rendering cards so we know which one to show.
+    syncTabs(data);
+    devs.forEach(dev => {
       const name = dev.name || "?";
       seen.add(name);
       let card = existing.get(name);
@@ -1047,12 +1437,31 @@
         card.innerHTML = fresh.innerHTML;
       } else if (fresh) {
         devicesEl.appendChild(fresh);
+        card = fresh;
+      }
+      // Track card → tab mapping and apply initial visibility.
+      const entry = tabState.get(name);
+      if (entry) {
+        entry.card = card;
+        entry.available = true;
       }
     });
-    // Remove cards no longer visible (filtered out or removed from config)
+    // Drop stale cards that no longer correspond to any device in /api/status.
     existing.forEach((node, name) => {
       if (!seen.has(name)) node.remove();
     });
+    // Pick an active device if we don't have one yet, or if the current one
+    // got filtered out. Honor the URL hash on first load.
+    if (!syncActiveFromHash()) {
+      if (!activeDevice || !tabState.has(activeDevice)) {
+        const first = devs[0] && devs[0].name;
+        if (first) setActiveDevice(first, { fromUser: false });
+      } else {
+        // Re-apply active state to push current selection through to the
+        // newly-rendered card DOM (which may have just been re-created).
+        setActiveDevice(activeDevice, { fromUser: false });
+      }
+    }
   }
 
   /* ---------- global errors / banner / toast ---------- */
@@ -1165,13 +1574,20 @@
   }
 
   /* ---------- filter UI ---------- */
+  // In tabbed mode the filter chips and the search box act on the tab bar,
+  // not on a flat list of cards (since only one card is visible at a time).
+  // We re-render the underlying data (so cards are kept in sync) but the
+  // primary effect of a filter change is to hide non-matching tabs.
   function bindFilters() {
     segBtns.forEach(btn => {
       btn.addEventListener("click", () => {
         segBtns.forEach(b => { b.classList.remove("active"); b.setAttribute("aria-selected", "false"); });
         btn.classList.add("active"); btn.setAttribute("aria-selected", "true");
         activeFilter = btn.getAttribute("data-filter") || "all";
-        if (lastData) renderList(lastData);
+        if (lastData) {
+          // Re-render so cards are fresh; then apply the filter to tabs.
+          renderList(lastData);
+        }
       });
     });
     const onText = debounce(() => {
@@ -1179,6 +1595,14 @@
       if (lastData) renderList(lastData);
     }, 150);
     filterInput.addEventListener("input", onText);
+    // Also react to browser back/forward or direct hash navigation.
+    window.addEventListener("hashchange", () => {
+      if (suppressHash) return;
+      if (syncActiveFromHash()) return;
+      // No device in hash → fall back to the first visible tab.
+      const first = visibleDeviceOrder()[0];
+      if (first) setActiveDevice(first, { fromUser: false });
+    });
   }
 
   /* ---------- relative-time ticker ---------- */

@@ -120,7 +120,9 @@
     </div>
   </section>
 
-  <main id="devices" class="device-grid" aria-label="设备列表">
+  <nav class="device-tabs" id="device-tabs" role="tablist" aria-label="设备切换"></nav>
+
+  <main id="devices" class="device-grid device-grid-tabbed" aria-label="设备列表">
     <section class="card device-card skeleton" aria-hidden="true">
       <div class="card-head"><div class="sk sk-line w-50"></div><div class="sk sk-pill"></div></div>
       <div class="sk sk-line w-90"></div>
@@ -156,6 +158,10 @@
         </div>
         <div class="head-right">
           <span class="badge"></span>
+          <button type="button" class="refresh-btn" data-refresh-btn aria-label="立即刷新该设备">
+            <span class="refresh-icon" aria-hidden="true">🔄</span>
+            <span class="refresh-label">立即刷新</span>
+          </button>
           <span class="poll-interval" title="该设备单独轮询周期"></span>
         </div>
       </header>

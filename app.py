@@ -20,6 +20,7 @@ import logging
 import mimetypes
 import os
 import pathlib
+import re
 import shlex
 import socket
 import socketserver
@@ -884,6 +885,46 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self._check_auth():
             return
         path = self.path.split("?", 1)[0] or "/"
+        # Path dispatch: per-device manual refresh takes priority over the
+        # catch-all /api/tasks handler below.
+        refresh_match = re.match(r"^/api/devices/([A-Za-z0-9_-]+)/refresh$", path)
+        if refresh_match:
+            name = refresh_match.group(1)
+            target = next((d for d in (CONFIG.get("devices") or []) if isinstance(d, dict) and d.get("name") == name), None)
+            if not target:
+                self._send(404, json.dumps({"error": "device not found"}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+                return
+            try:
+                monitor = CONFIG.get("monitor") or {}
+                result = check_device(target, monitor)
+            except Exception as e:
+                logger.exception("manual refresh failed for %s", name)
+                self._send(500, json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+                return
+            try:
+                with STATE_LOCK:
+                    prev = list(STATE.get("devices") or [])
+                    new_devices: List[Dict[str, Any]] = []
+                    replaced = False
+                    for d in prev:
+                        if d.get("name") == name:
+                            new_devices.append(result)
+                            replaced = True
+                        else:
+                            new_devices.append(d)
+                    if not replaced:
+                        new_devices.append(result)
+                    order = {d.get("name"): i for i, d in enumerate(CONFIG.get("devices") or []) if isinstance(d, dict)}
+                    new_devices.sort(key=lambda x: order.get(x.get("name"), 10 ** 9))
+                    STATE["devices"] = new_devices
+                    STATE["updated_at"] = now_iso()
+            except Exception as e:
+                logger.exception("state update failed for manual refresh %s", name)
+                self._send(500, json.dumps({"error": f"state update failed: {e}"}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+                return
+            body = json.dumps(result, ensure_ascii=False).encode("utf-8")
+            self._send(200, body, "application/json; charset=utf-8")
+            return
         if path != "/api/tasks":
             self._send(404, json.dumps({"error": "not found"}).encode("utf-8"), "application/json; charset=utf-8")
             return
